@@ -42,6 +42,7 @@ CLASS_COLORS = {
 }
 
 YELLOW = np.array([255, 235, 0], dtype=np.uint8)
+CONTOUR_COLOR = (34, 197, 94)  # vibrant emerald green for crisp rounded borders
 
 
 # ─────────────────────────────────────────────────────────────
@@ -79,7 +80,7 @@ def build_medsam_model():
         print("segment_anything is not installed. MedSAM will not work.")
         return None
     try:
-        # Avoid CUDA deserialization error on CPU by loading weights with map_location
+        # Load weights with map_location to ensure CPU compatibility
         sam = sam_model_registry["vit_b"](checkpoint=None)
         state_dict = torch.load(MEDSAM_MODEL_PATH, map_location=device)
         sam.load_state_dict(state_dict)
@@ -136,27 +137,80 @@ def preprocess(image_rgb):
     return x, original_h, original_w
 
 
+def round_off_mask(binary_mask):
+    """Smooths and fills holes in nucleus mask to produce rounded, convex boundaries."""
+    if not binary_mask.any():
+        return binary_mask
+    mask_u = binary_mask.astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed = cv2.morphologyEx(mask_u, cv2.MORPH_CLOSE, kernel)
+    
+    cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(closed)
+    for c in cnts:
+        if cv2.contourArea(c) > 20:
+            cv2.drawContours(filled, [c], -1, 1, -1)
+    return filled.astype(bool)
+
+
 def detect_candidate_nuclei_boxes(image_rgb):
-    """Detect candidate dark nuclei bounding boxes for batch MedSAM segmentation."""
+    """
+    Detects nuclei bounding boxes for MedSAM segmentation:
+    1. First searches for hand-marked annotations (yellow, orange, green, cyan)
+       drawn on cytology or tissue slides.
+    2. If no annotations are present, falls back to automatic dark nucleus blob detection.
+    """
     h, w = image_rgb.shape[:2]
+    r, g, b = cv2.split(image_rgb)
+    hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+    h_ch, s_ch, v_ch = cv2.split(hsv)
+    
+    # 1. Detect yellow/orange pen or pencil markings
+    yellow_mark = (h_ch >= 4) & (h_ch <= 36) & (s_ch >= 22) & (v_ch >= 130)
+    yellow_mark = yellow_mark & (((r.astype(int) + g.astype(int)) // 2 - b.astype(int)) > 14)
+    
+    # Green / Cyan markings
+    green_mark = (h_ch >= 37) & (h_ch <= 95) & (s_ch >= 50)
+    
+    marks = (yellow_mark | green_mark).astype(np.uint8) * 255
+    
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    dilated = cv2.dilate(marks, kernel)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    marked_boxes = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        if area > 25 and 10 < bw < 130 and 10 < bh < 130 and by > 35:
+            pad = 2
+            x1 = max(0, bx - pad)
+            y1 = max(0, by - pad)
+            x2 = min(w, bx + bw + pad)
+            y2 = min(h, by + bh + pad)
+            marked_boxes.append([x1, y1, x2, y2])
+            
+    if len(marked_boxes) > 0:
+        return marked_boxes, True
+
+    # 2. Fallback: Automatic dark nucleus detector
     gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
     inv = 255 - gray
-    
     thresh = cv2.adaptiveThreshold(
         inv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, -10
     )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, k)
+    cnts, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     boxes = []
     min_area = max(35, int(h * w * 0.001))
-    max_area = int(h * w * 0.25)
-    for cnt in contours:
+    max_area = int(h * w * 0.15)
+    for cnt in cnts:
         area = cv2.contourArea(cnt)
         if min_area < area < max_area:
             bx, by, bw, bh = cv2.boundingRect(cnt)
-            pad = 8
+            pad = 4
             x1 = max(0, bx - pad)
             y1 = max(0, by - pad)
             x2 = min(w, bx + bw + pad)
@@ -165,7 +219,7 @@ def detect_candidate_nuclei_boxes(image_rgb):
             
     if len(boxes) > 20:
         boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)[:20]
-    return boxes
+    return boxes, False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -175,7 +229,7 @@ def predict_image(image_rgb, model_choice):
     """
     Runs segmentation based on model selection:
     - Herlev: full semantic segmentation (Background, Cytoplasm, Nucleus)
-    - MedSAM: identifies all candidate nuclei together, ready for interactive addition
+    - MedSAM: identifies all marked/candidate nuclei together and rounds them off
     """
     if image_rgb is None:
         return None, "Upload an image first.", None
@@ -195,8 +249,7 @@ def predict_image(image_rgb, model_choice):
         
         medsam_predictor.set_image(image_rgb)
         
-        # Detect candidate nuclei and segment them together
-        boxes = detect_candidate_nuclei_boxes(image_rgb)
+        boxes, is_marked = detect_candidate_nuclei_boxes(image_rgb)
         combined_mask = np.zeros((h, w), dtype=bool)
         nuclei_count = 0
         
@@ -212,7 +265,8 @@ def predict_image(image_rgb, model_choice):
                 )
                 for m in masks:
                     m_np = m[0].cpu().numpy()
-                    combined_mask = combined_mask | m_np
+                    m_rounded = round_off_mask(m_np)
+                    combined_mask = combined_mask | m_rounded
                 nuclei_count = len(boxes)
             except Exception as e:
                 print("MedSAM batch detection exception:", e)
@@ -226,15 +280,24 @@ def predict_image(image_rgb, model_choice):
                 + 0.48 * yellow_layer[combined_mask].astype(np.float32)
             ).astype(np.uint8)
             
+            # Draw smooth green/yellow contours rounding off the nuclei
             contours, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(result, contours, -1, (255, 235, 0), 2)
+            cv2.drawContours(result, contours, -1, CONTOUR_COLOR, 2)
             
-            info = (
-                f"### MedSAM: **{nuclei_count} Nuclei Identified Together**\n\n"
-                f"- Automatically identified {nuclei_count} nuclei across the image.\n"
-                f"- **Interactive Mode**: Click on any nucleus or cell to add it or refine the mask.\n"
-                f"- All nuclei are highlighted together in yellow."
-            )
+            if is_marked:
+                info = (
+                    f"### MedSAM: **{nuclei_count} Hand-Marked Nuclei Identified & Rounded Off Together**\n\n"
+                    f"- Detected **{nuclei_count} hand-marked regions** from your annotations.\n"
+                    f"- MedSAM successfully isolated and rounded off each marked nucleus.\n"
+                    f"- **Interactive Mode**: Click on any additional nucleus or cell to add it to the group!"
+                )
+            else:
+                info = (
+                    f"### MedSAM: **{nuclei_count} Nuclei Identified & Rounded Off Together**\n\n"
+                    f"- Automatically identified and rounded off **{nuclei_count} candidate nuclei**.\n"
+                    f"- **Interactive Mode**: Click on any nucleus or cell to add it or refine the mask.\n"
+                    f"- All nuclei are highlighted together in yellow."
+                )
         else:
             info = (
                 "### MedSAM Ready\n\n"
@@ -245,6 +308,7 @@ def predict_image(image_rgb, model_choice):
             "image": image_rgb,
             "mask": combined_mask,
             "points": [],
+            "boxes": boxes,
             "nuclei_count": nuclei_count,
             "model": "MedSAM"
         }
@@ -290,7 +354,7 @@ def select_region(state, evt: gr.SelectData):
     Click callback:
     - Never returns None (so the image never disappears!)
     - For Herlev: highlights all regions belonging to the clicked class
-    - For MedSAM: segments the clicked nucleus and accumulates it with all other nuclei
+    - For MedSAM: segments the clicked nucleus, rounds it off, and accumulates it with all other nuclei
     """
     if state is None or state.get("image") is None:
         return gr.skip(), "Upload an image and run segmentation first."
@@ -306,9 +370,18 @@ def select_region(state, evt: gr.SelectData):
         if medsam_predictor is None:
             return image_rgb, "Error: MedSAM model not loaded."
         
-        # Adaptive bounding box around clicked coordinate
-        r = max(18, min(45, int(min(h, w) * 0.08)))
-        box = np.array([max(0, x - r), max(0, y - r), min(w, x + r), min(h, y + r)])
+        # Check if click is near any existing detected/marked box
+        chosen_box = None
+        for b in state.get("boxes", []):
+            if (b[0] - 15 <= x <= b[2] + 15) and (b[1] - 15 <= y <= b[3] + 15):
+                chosen_box = np.array(b)
+                break
+                
+        if chosen_box is None:
+            # Optimal compact radius (16px) for sharp, rounded nucleus extraction
+            r = max(14, min(22, int(min(h, w) * 0.05)))
+            chosen_box = np.array([max(0, x - r), max(0, y - r), min(w, x + r), min(h, y + r)])
+
         input_point = np.array([[x, y]])
         input_label = np.array([1])
         
@@ -316,10 +389,11 @@ def select_region(state, evt: gr.SelectData):
             masks, scores, _ = medsam_predictor.predict(
                 point_coords=input_point,
                 point_labels=input_label,
-                box=box,
+                box=chosen_box,
                 multimask_output=False
             )
-            new_mask = masks[0]
+            raw_mask = masks[0]
+            new_mask = round_off_mask(raw_mask)
         except Exception as e:
             print("MedSAM prediction error:", e)
             return image_rgb, f"MedSAM prediction error: {e}"
@@ -352,27 +426,28 @@ def select_region(state, evt: gr.SelectData):
             + 0.48 * yellow_layer[combined_mask].astype(np.float32)
         ).astype(np.uint8)
         
+        # Draw smooth rounded contours
         contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(result, contours, -1, (255, 235, 0), 2)
+        cv2.drawContours(result, contours, -1, CONTOUR_COLOR, 2)
         
-        # Markers for clicks
+        # Numbered markers for user clicks
         for idx, (px, py) in enumerate(points):
-            cv2.circle(result, (px, py), 6, (255, 235, 0), -1)
-            cv2.circle(result, (px, py), 8, (0, 0, 0), 2)
-            cv2.putText(result, str(idx + 1), (px + 7, py - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2)
-            cv2.putText(result, str(idx + 1), (px + 7, py - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            cv2.circle(result, (px, py), 5, (255, 235, 0), -1)
+            cv2.circle(result, (px, py), 7, (0, 0, 0), 2)
+            cv2.putText(result, str(idx + 1), (px + 6, py - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 2)
+            cv2.putText(result, str(idx + 1), (px + 6, py - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
             
         selected_pixels = int(combined_mask.sum())
         total_pixels = int(combined_mask.size)
         selected_percent = 100 * selected_pixels / total_pixels
         
         message = (
-            f"### MedSAM: **{nuclei_count} Nuclei Identified Together**\n\n"
-            f"- Click position: `x={x}, y={y}` (Nucleus #{len(points)})\n"
-            f"- Confidence score: `{scores[0]:.3f}`\n"
+            f"### MedSAM: **{nuclei_count} Nuclei Identified & Rounded Off Together**\n\n"
+            f"- Last clicked position: `x={x}, y={y}` (Nucleus #{len(points)})\n"
+            f"- Nucleus confidence: `{scores[0]:.3f}`\n"
             f"- Total identified nuclei: `{nuclei_count}`\n"
             f"- Combined area: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of image)\n\n"
-            f"All identified nuclei are displayed together in transparent yellow. Click any additional nucleus to add it!"
+            f"All nuclei are highlighted together with smooth, rounded contours. Click any additional nucleus to add it!"
         )
         return result, message
 
@@ -432,9 +507,9 @@ with gr.Blocks(title="Cervical Cell Segmentation & Nuclei Identification") as de
         """
         # Cervical Cell Semantic Segmentation & MedSAM Nuclei Identification
 
-        Upload a cervical-cell image and select your segmentation model:
+        Upload a cervical-cell or histology image and select your segmentation model:
         - **Herlev (EffNet-B7)**: End-to-end multi-class segmentation (**Background**, **Cytoplasm**, **Nucleus**).
-        - **MedSAM (ViT-B)**: Medical foundation model capable of identifying **multiple nuclei together** automatically and via interactive point clicks!
+        - **MedSAM (ViT-B)**: Medical foundation model that identifies and **rounds off multiple nuclei together**—supports hand-marked annotations and interactive click accumulation!
         """
     )
 
@@ -454,7 +529,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & Nuclei Identification") as de
 
     with gr.Row():
         input_image = gr.Image(
-            label="1. Upload raw cervical-cell image",
+            label="1. Upload raw cervical-cell image (or marked annotations)",
             type="numpy",
             image_mode="RGB",
         )
@@ -525,7 +600,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & Nuclei Identification") as de
         - Transparent yellow: Region selected by your click
 
         ### Colour legend (MedSAM)
-        - Transparent yellow: Multiple nuclei identified together (both auto-detected & added via clicks)
+        - Transparent yellow + Green boundary: Nuclei accurately segmented and rounded off together (both auto-detected / hand-marked & added via clicks)
         """
     )
 
