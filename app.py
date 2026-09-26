@@ -1,5 +1,6 @@
 import os
 import cv2
+import threading
 import numpy as np
 import torch
 import gradio as gr
@@ -105,6 +106,7 @@ print("Models loaded successfully.")
 print("Device:", device)
 
 _cached_medsam_sig = None
+_medsam_lock = threading.Lock()
 
 
 def ensure_medsam_image(image_rgb):
@@ -114,9 +116,21 @@ def ensure_medsam_image(image_rgb):
         return
     sig = (image_rgb.shape, int(image_rgb[0, 0, 0]), int(image_rgb[-1, -1, 0]), int(image_rgb.mean()))
     if _cached_medsam_sig != sig:
-        with torch.inference_mode():
-            medsam_predictor.set_image(image_rgb)
-        _cached_medsam_sig = sig
+        with _medsam_lock:
+            if _cached_medsam_sig != sig:
+                with torch.inference_mode():
+                    medsam_predictor.set_image(image_rgb)
+                _cached_medsam_sig = sig
+
+
+def prewarm_medsam_image(image_rgb):
+    """Asynchronously pre-encodes the image in the background so manual selection is instant."""
+    if image_rgb is not None:
+        threading.Thread(target=ensure_medsam_image, args=(image_rgb,), daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────
+# Image helpers
 # ─────────────────────────────────────────────────────────────
 def colorize_mask(mask):
     """Convert label IDs 0/1/2 into an RGB segmentation image."""
@@ -323,6 +337,7 @@ def predict_image(image_rgb, model_choice):
     h, w = image_rgb.shape[:2]
 
     if model_choice == "MedSAM (Manual Only)":
+        prewarm_medsam_image(image_rgb)
         combined_mask = np.zeros((h, w), dtype=bool)
         info = (
             "### MedSAM: **Manual Selection Mode**\n\n"
@@ -335,7 +350,7 @@ def predict_image(image_rgb, model_choice):
             "doctor_targets": [],
             "model": "MedSAM"
         }
-        return image_rgb, info, state
+        return {"background": image_rgb, "layers": [], "composite": image_rgb}, info, state
 
     if model_choice == "MedSAM (ViT-B)":
         if medsam_predictor is None:
@@ -376,8 +391,8 @@ def predict_image(image_rgb, model_choice):
         info = (
             f"### MedSAM: **{total_nuclei} Nuclei Segmented Across Whole Slide**\n\n"
             f"- Automatically identified and rounded off **{auto_count} candidate nuclei** across top, center, and bottom fields.\n"
-            f"- **Doctor Targeting Active**: Click directly on any missed nucleus in the image.\n"
-            f"- Every clicked point will be remembered, rigorously segmented, and merged with existing data!"
+            f"- **Doctor Targeting Active**: Click or circle directly on any missed nucleus in the image.\n"
+            f"- Every targeted point will be remembered, rigorously segmented, and merged with existing data!"
         )
             
         state = {
@@ -387,7 +402,7 @@ def predict_image(image_rgb, model_choice):
             "doctor_targets": [],
             "model": "MedSAM"
         }
-        return result, info, state
+        return {"background": result, "layers": [], "composite": result}, info, state
 
     # Herlev inference
     x, original_h, original_w = preprocess(image_rgb)
@@ -418,7 +433,7 @@ def predict_image(image_rgb, model_choice):
         "Red = Background | Dark blue = Cytoplasm | Light blue = Nucleus"
     )
 
-    return overlay, info, state
+    return {"background": overlay, "layers": [], "composite": overlay}, info, state
 
 
 # ─────────────────────────────────────────────────────────────
@@ -488,7 +503,7 @@ def select_region(state, evt: gr.SelectData):
             f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
             f"Showing **previous auto-detected nuclei + all doctor-targeted nuclei** together in transparent yellow with green rounded boundaries!"
         )
-        return result, message
+        return {"background": result, "layers": [], "composite": result}, message
 
     # Herlev interaction
     mask = state["mask"]
@@ -520,7 +535,7 @@ def select_region(state, evt: gr.SelectData):
         f"The transparent yellow overlay marks the predicted **{class_name.lower()}** region."
     )
 
-    return result, message
+    return {"background": result, "layers": [], "composite": result}, message
 
 
 def target_drawn_circle(editor_data, state):
@@ -634,7 +649,7 @@ def target_drawn_circle(editor_data, state):
             f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
             f"Vague circled shapes are now **perfected into rounded nuclei** and shown with previous auto-detected nuclei in yellow with green contours!"
         )
-        return result, message, state
+        return {"background": result, "layers": [], "composite": result}, message, state
 
     # Herlev fallback if user draws with Herlev active
     cnts, _ = cv2.findContours(stroke_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -672,7 +687,7 @@ def target_drawn_circle(editor_data, state):
         f"- Selected area: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of image)\n\n"
         f"The transparent yellow overlay marks the predicted **{class_name.lower()}** region."
     )
-    return result, message, state
+    return {"background": result, "layers": [], "composite": result}, message, state
 
 
 def reset_doctor_targets(state):
@@ -686,7 +701,7 @@ def reset_doctor_targets(state):
     
     result = render_medsam_display(image_rgb, auto_mask, [])
     info = "Doctor manual targets reset. Base auto-detected nuclei preserved. Circle or click any nucleus to target again!"
-    return result, info, state
+    return {"background": result, "layers": [], "composite": result}, info, state
 
 
 def clear_app():
@@ -765,7 +780,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         outputs=[output_image, selected_info, state],
     )
 
-    output_image.change(
+    output_image.input(
         fn=target_drawn_circle,
         inputs=[output_image, state],
         outputs=[output_image, selected_info, state],
