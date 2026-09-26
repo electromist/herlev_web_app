@@ -271,8 +271,8 @@ def target_nucleus_rigorous(predictor, image_rgb, px, py):
     return filled.astype(bool), (cx, cy), scores[0]
 
 
-def render_medsam_display(image_rgb, combined_mask, doctor_targets):
-    """Renders composite display showing all nuclei + doctor targeted points."""
+def render_medsam_display(image_rgb, combined_mask, doctor_targets=None):
+    """Renders composite display showing all nuclei."""
     result = image_rgb.copy()
     if combined_mask.any():
         yellow_layer = np.zeros_like(result)
@@ -285,13 +285,6 @@ def render_medsam_display(image_rgb, combined_mask, doctor_targets):
         # Smooth green boundary contours for all nuclei
         cnts, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(result, cnts, -1, CONTOUR_COLOR, 2)
-        
-    # Mark doctor targeted points with distinct identifiers
-    for idx, (px, py) in enumerate(doctor_targets):
-        cv2.circle(result, (px, py), 5, (0, 0, 255), -1)  # red dot
-        cv2.circle(result, (px, py), 8, (255, 255, 255), 2)  # white border
-        cv2.putText(result, f"#{idx+1}", (px + 7, py - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 2)
-        cv2.putText(result, f"#{idx+1}", (px + 7, py - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 220), 1)
         
     return result
 
@@ -318,12 +311,29 @@ def predict_image(image_rgb, model_choice):
     image_rgb = image_rgb.astype(np.uint8)
     h, w = image_rgb.shape[:2]
 
-    if model_choice == "MedSAM (ViT-B)":
+    if "MedSAM" in model_choice:
         if medsam_predictor is None:
             return image_rgb, "Error: MedSAM model failed to load.", None
         
         medsam_predictor.set_image(image_rgb)
         
+        if model_choice == "MedSAM (Manual Only)":
+            combined_mask = np.zeros((h, w), dtype=bool)
+            result = render_medsam_display(image_rgb, combined_mask)
+            info = (
+                "### MedSAM: **Manual Selection Mode**\n\n"
+                "- No automatic segmentation has been run.\n"
+                "- The image is displayed as-is: use the brush tool to circle around any nucleus to predict and select it!"
+            )
+            state = {
+                "image": image_rgb,
+                "auto_mask": combined_mask.copy(),
+                "mask": combined_mask,
+                "doctor_targets": [],
+                "model": "MedSAM"
+            }
+            return result, info, state
+
         # Detect candidate nuclei across the entire slide
         boxes = detect_all_nuclei_boxes(image_rgb)
         combined_mask = np.zeros((h, w), dtype=bool)
@@ -664,8 +674,8 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
         Upload a cervical-cell or histology slide and select your model:
         - **Herlev (EffNet-B7)**: Multi-class semantic segmentation (**Background**, **Cytoplasm**, **Nucleus**).
-        - **MedSAM (ViT-B)**: Medical foundation model that **detects nuclei across the whole slide**. 
-          Doctors can **manually target any missed nuclei** by circling around them with the brush tool (brush size adjustable): the system predicts and refines the exact rounded nucleus, remembers all targeted points, and shows **previous + new doctor targets together**!
+        - **MedSAM (ViT-B)**: Whole-slide automatic nucleus detection + brush manual refinement.
+        - **MedSAM (Manual Only)**: Pure manual mode — image is displayed as-is, circle any nucleus with the brush tool to predict and select it.
         """
     )
 
@@ -676,7 +686,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     gr.Markdown(model_status)
 
     model_choice = gr.Radio(
-        choices=["Herlev (EffNet-B7)", "MedSAM (ViT-B)"],
+        choices=["Herlev (EffNet-B7)", "MedSAM (ViT-B)", "MedSAM (Manual Only)"],
         value="Herlev (EffNet-B7)",
         label="Select Model"
     )
@@ -765,8 +775,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         - Transparent yellow: Region selected by your click
 
         ### Colour legend (MedSAM)
-        - Transparent yellow + Green boundary: All identified & rounded-off nuclei across the slide
-        - Red dot + White border (`#1`, `#2`, ...): Manually targeted & verified nuclei by doctor
+        - Transparent yellow + Green boundary: All identified & rounded-off nuclei
         """
     )
 
