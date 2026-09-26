@@ -1,0 +1,29 @@
+# Checkpoints & Model weights (Do not commit models)
+*.pth
+*.pt
+*.bin
+*.onnx
+*.safetensors
+herlev_effnetb7_fpn.pth
+medsam_vit_b.pth
+
+# Python / Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv/
+venv/
+env/
+ENV/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temp files & Backups
+/copy
+*.log
