@@ -104,9 +104,19 @@ medsam_predictor = build_medsam_model()
 print("Models loaded successfully.")
 print("Device:", device)
 
+_cached_medsam_sig = None
 
-# ─────────────────────────────────────────────────────────────
-# Image helpers
+
+def ensure_medsam_image(image_rgb):
+    """Encodes image in MedSAM only once per image, using fast inference_mode."""
+    global _cached_medsam_sig
+    if medsam_predictor is None or image_rgb is None:
+        return
+    sig = (image_rgb.shape, int(image_rgb[0, 0, 0]), int(image_rgb[-1, -1, 0]), int(image_rgb.mean()))
+    if _cached_medsam_sig != sig:
+        with torch.inference_mode():
+            medsam_predictor.set_image(image_rgb)
+        _cached_medsam_sig = sig
 # ─────────────────────────────────────────────────────────────
 def colorize_mask(mask):
     """Convert label IDs 0/1/2 into an RGB segmentation image."""
@@ -211,10 +221,10 @@ def detect_all_nuclei_boxes(image_rgb):
     for r_idx in range(n_rows):
         for c_idx in range(n_cols):
             cell_cands = sorted(grid[r_idx][c_idx], key=lambda x: x[0], reverse=True)
-            for sc, b_box in cell_cands[:2]:
+            for sc, b_box in cell_cands[:1]:
                 selected_boxes.append(b_box)
                 
-    return selected_boxes
+    return selected_boxes[:25]
 
 
 def target_nucleus_rigorous(predictor, image_rgb, px, py):
@@ -238,12 +248,13 @@ def target_nucleus_rigorous(predictor, image_rgb, px, py):
     r = 16
     box = np.array([max(0, cx - r), max(0, cy - r), min(w, cx + r), min(h, cy + r)])
     
-    masks, scores, _ = predictor.predict(
-        point_coords=np.array([[cx, cy]]),
-        point_labels=np.array([1]),
-        box=box,
-        multimask_output=False
-    )
+    with torch.inference_mode():
+        masks, scores, _ = predictor.predict(
+            point_coords=np.array([[cx, cy]]),
+            point_labels=np.array([1]),
+            box=box,
+            multimask_output=False
+        )
     raw_mask = masks[0]
     
     # Isolate component closest to true center
@@ -311,28 +322,26 @@ def predict_image(image_rgb, model_choice):
     image_rgb = image_rgb.astype(np.uint8)
     h, w = image_rgb.shape[:2]
 
-    if "MedSAM" in model_choice:
+    if model_choice == "MedSAM (Manual Only)":
+        combined_mask = np.zeros((h, w), dtype=bool)
+        info = (
+            "### MedSAM: **Manual Selection Mode**\n\n"
+            "- Ready! Use the brush tool to circle around any nucleus to predict and select it."
+        )
+        state = {
+            "image": image_rgb,
+            "auto_mask": combined_mask.copy(),
+            "mask": combined_mask,
+            "doctor_targets": [],
+            "model": "MedSAM"
+        }
+        return image_rgb, info, state
+
+    if model_choice == "MedSAM (ViT-B)":
         if medsam_predictor is None:
             return image_rgb, "Error: MedSAM model failed to load.", None
         
-        medsam_predictor.set_image(image_rgb)
-        
-        if model_choice == "MedSAM (Manual Only)":
-            combined_mask = np.zeros((h, w), dtype=bool)
-            result = render_medsam_display(image_rgb, combined_mask)
-            info = (
-                "### MedSAM: **Manual Selection Mode**\n\n"
-                "- No automatic segmentation has been run.\n"
-                "- The image is displayed as-is: use the brush tool to circle around any nucleus to predict and select it!"
-            )
-            state = {
-                "image": image_rgb,
-                "auto_mask": combined_mask.copy(),
-                "mask": combined_mask,
-                "doctor_targets": [],
-                "model": "MedSAM"
-            }
-            return result, info, state
+        ensure_medsam_image(image_rgb)
 
         # Detect candidate nuclei across the entire slide
         boxes = detect_all_nuclei_boxes(image_rgb)
@@ -341,24 +350,25 @@ def predict_image(image_rgb, model_choice):
         
         if len(boxes) > 0:
             try:
-                boxes_tensor = torch.tensor(boxes, device=device)
-                transformed_boxes = medsam_predictor.transform.apply_boxes_torch(boxes_tensor, (h, w))
-                masks, scores, _ = medsam_predictor.predict_torch(
-                    point_coords=None,
-                    point_labels=None,
-                    boxes=transformed_boxes,
-                    multimask_output=False
-                )
-                k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                for m in masks:
-                    m_np = m[0].cpu().numpy().astype(np.uint8)
-                    m_smooth = cv2.morphologyEx(m_np, cv2.MORPH_CLOSE, k_close)
-                    combined_mask = combined_mask | (m_smooth > 0)
-                auto_count = len(boxes)
+                with torch.inference_mode():
+                    boxes_tensor = torch.tensor(boxes, device=device)
+                    transformed_boxes = medsam_predictor.transform.apply_boxes_torch(boxes_tensor, (h, w))
+                    masks, scores, _ = medsam_predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed_boxes,
+                        multimask_output=False
+                    )
+                    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    for m in masks:
+                        m_np = m[0].cpu().numpy().astype(np.uint8)
+                        m_smooth = cv2.morphologyEx(m_np, cv2.MORPH_CLOSE, k_close)
+                        combined_mask = combined_mask | (m_smooth > 0)
+                    auto_count = len(boxes)
             except Exception as e:
                 print("MedSAM whole-slide batch exception:", e)
         
-        result = render_medsam_display(image_rgb, combined_mask, [])
+        result = render_medsam_display(image_rgb, combined_mask)
         
         cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         total_nuclei = len(cnts_tot)
@@ -436,9 +446,16 @@ def select_region(state, evt: gr.SelectData):
         if medsam_predictor is None:
             return image_rgb, "Error: MedSAM model not loaded."
 
+        existing_mask = state.get("mask")
+        if existing_mask is not None and existing_mask.shape == (h, w) and existing_mask[y, x]:
+            return gr.skip(), gr.skip()
+
+        ensure_medsam_image(image_rgb)
+
         # Rigorously segment the nucleus at the clicked location
         try:
-            new_nuc_mask, (cx, cy), conf = target_nucleus_rigorous(medsam_predictor, image_rgb, x, y)
+            with torch.inference_mode():
+                new_nuc_mask, (cx, cy), conf = target_nucleus_rigorous(medsam_predictor, image_rgb, x, y)
         except Exception as e:
             print("MedSAM targeting error:", e)
             return image_rgb, f"MedSAM targeting error: {e}"
@@ -449,7 +466,6 @@ def select_region(state, evt: gr.SelectData):
         state["doctor_targets"] = doctor_targets
 
         # Accumulate with previous data (Purana + Naya)
-        existing_mask = state.get("mask")
         if existing_mask is None or existing_mask.shape != (h, w):
             combined_mask = new_nuc_mask
         else:
@@ -457,7 +473,7 @@ def select_region(state, evt: gr.SelectData):
         state["mask"] = combined_mask
 
         # Render combined display
-        result = render_medsam_display(image_rgb, combined_mask, doctor_targets)
+        result = render_medsam_display(image_rgb, combined_mask)
 
         cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         total_nuclei = len(cnts_tot)
@@ -549,9 +565,12 @@ def target_drawn_circle(editor_data, state):
         combined_mask = state.get("mask", np.zeros((h, w), dtype=bool))
         newly_added = 0
 
+        # Sort contours from largest to smallest
+        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+
         for c in cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
-            if bw < 3 or bh < 3:
+            if bw < 5 or bh < 5:
                 continue
 
             pad = 4
@@ -570,14 +589,24 @@ def target_drawn_circle(editor_data, state):
             cx = x1 + min_loc[0]
             cy = y1 + min_loc[1]
 
+            # Fast skip if this nucleus is already segmented or already recorded
+            if combined_mask[cy, cx]:
+                continue
+            if any((cx - tx)**2 + (cy - ty)**2 < 144 for tx, ty in doctor_targets):
+                continue
+
+            # Ensure image embeddings are ready (computed once per image, then cached)
+            ensure_medsam_image(image_rgb)
+
             box_prompt = np.array([x1, y1, x2, y2])
             try:
-                masks, scores, _ = medsam_predictor.predict(
-                    box=box_prompt,
-                    point_coords=np.array([[cx, cy]]),
-                    point_labels=np.array([1]),
-                    multimask_output=False
-                )
+                with torch.inference_mode():
+                    masks, scores, _ = medsam_predictor.predict(
+                        box=box_prompt,
+                        point_coords=np.array([[cx, cy]]),
+                        point_labels=np.array([1]),
+                        multimask_output=False
+                    )
                 refined = round_off_mask(masks[0])
                 combined_mask = combined_mask | refined
                 doctor_targets.append((cx, cy))
@@ -591,7 +620,7 @@ def target_drawn_circle(editor_data, state):
         state["mask"] = combined_mask
         state["doctor_targets"] = doctor_targets
 
-        result = render_medsam_display(image_rgb, combined_mask, doctor_targets)
+        result = render_medsam_display(image_rgb, combined_mask)
 
         cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         total_nuclei = len(cnts_tot)
