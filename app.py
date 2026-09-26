@@ -497,6 +497,145 @@ def select_region(state, evt: gr.SelectData):
     return result, message
 
 
+def target_drawn_circle(editor_data, state):
+    """
+    Doctor Circling / Brush Tool Callback:
+    - Extracts drawn circle(s) / brush strokes from the segmentation result.
+    - Accurately detects the nucleus core inside the doctor's circled boundary.
+    - MedSAM rigorously segments and rounds off the nucleus, turning vague shapes into perfect nuclei.
+    - Accumulates previous + newly circled doctor targets.
+    """
+    if state is None or state.get("image") is None:
+        return gr.skip(), gr.skip(), gr.skip()
+
+    if not isinstance(editor_data, dict):
+        return gr.skip(), gr.skip(), gr.skip()
+
+    layers = editor_data.get("layers", [])
+    if not layers:
+        return gr.skip(), gr.skip(), gr.skip()
+
+    image_rgb = state["image"].copy()
+    h, w = image_rgb.shape[:2]
+
+    # Combine all drawn stroke layers
+    stroke_mask = np.zeros((h, w), dtype=bool)
+    for l in layers:
+        if isinstance(l, np.ndarray) and l.ndim == 3 and l.shape[2] == 4:
+            stroke_mask = stroke_mask | (l[:, :, 3] > 0)
+
+    if not stroke_mask.any():
+        return gr.skip(), gr.skip(), gr.skip()
+
+    if state.get("model") == "MedSAM":
+        if medsam_predictor is None:
+            return gr.skip(), "Error: MedSAM model not loaded.", state
+
+        cnts, _ = cv2.findContours(stroke_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return gr.skip(), gr.skip(), gr.skip()
+
+        doctor_targets = state.get("doctor_targets", [])
+        combined_mask = state.get("mask", np.zeros((h, w), dtype=bool))
+        newly_added = 0
+
+        for c in cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw < 3 or bh < 3:
+                continue
+
+            pad = 4
+            x1 = max(0, bx - pad)
+            y1 = max(0, by - pad)
+            x2 = min(w, bx + bw + pad)
+            y2 = min(h, by + bh + pad)
+
+            # Find the true nucleus core (highest hematoxylin optical density / darkest green channel)
+            patch = image_rgb[y1:y2, x1:x2]
+            if patch.size == 0:
+                continue
+            min_val, _, min_loc, _ = cv2.minMaxLoc(patch[:, :, 1])
+            if min_val > 215:
+                continue
+            cx = x1 + min_loc[0]
+            cy = y1 + min_loc[1]
+
+            box_prompt = np.array([x1, y1, x2, y2])
+            try:
+                masks, scores, _ = medsam_predictor.predict(
+                    box=box_prompt,
+                    point_coords=np.array([[cx, cy]]),
+                    point_labels=np.array([1]),
+                    multimask_output=False
+                )
+                refined = round_off_mask(masks[0])
+                combined_mask = combined_mask | refined
+                doctor_targets.append((cx, cy))
+                newly_added += 1
+            except Exception as e:
+                print("MedSAM brush circling error:", e)
+
+        if newly_added == 0:
+            return gr.skip(), gr.skip(), gr.skip()
+
+        state["mask"] = combined_mask
+        state["doctor_targets"] = doctor_targets
+
+        result = render_medsam_display(image_rgb, combined_mask, doctor_targets)
+
+        cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        total_nuclei = len(cnts_tot)
+        selected_pixels = int(combined_mask.sum())
+        selected_percent = 100 * selected_pixels / (h * w)
+
+        message = (
+            f"### MedSAM: **{total_nuclei} Nuclei Segmented Together**\n\n"
+            f"- **Doctor Brush Circling**: Added and perfected **{newly_added} circled nucleus candidate(s)**\n"
+            f"- **Doctor Targets Remembered**: `{len(doctor_targets)}` manually verified nuclei\n"
+            f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
+            f"Vague circled shapes are now **perfected into rounded nuclei** and shown with previous auto-detected nuclei in yellow with green contours!"
+        )
+        return result, message, state
+
+    # Herlev fallback if user draws with Herlev active
+    cnts, _ = cv2.findContours(stroke_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return gr.skip(), gr.skip(), gr.skip()
+    bx, by, bw, bh = cv2.boundingRect(cnts[0])
+    cx = min(w - 1, max(0, bx + bw // 2))
+    cy = min(h - 1, max(0, by + bh // 2))
+
+    class_mask = state["mask"]
+    class_id = int(class_mask[cy, cx])
+    class_name = CLASS_NAMES[class_id]
+
+    result = make_overlay(image_rgb, class_mask, alpha=0.42)
+    selected = class_mask == class_id
+    yellow_layer = np.zeros_like(result)
+    yellow_layer[selected] = YELLOW
+
+    result[selected] = (
+        0.52 * result[selected].astype(np.float32)
+        + 0.48 * yellow_layer[selected].astype(np.float32)
+    ).astype(np.uint8)
+
+    cv2.circle(result, (cx, cy), 7, (255, 235, 0), -1)
+    cv2.circle(result, (cx, cy), 9, (0, 0, 0), 2)
+
+    selected_pixels = int(selected.sum())
+    total_pixels = int(class_mask.size)
+    selected_percent = 100 * selected_pixels / total_pixels
+
+    message = (
+        f"### Selected: **{class_name}**\n\n"
+        f"- Target position: `x={cx}, y={cy}`\n"
+        f"- Predicted class ID: `{class_id}`\n"
+        f"- Selected area: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of image)\n\n"
+        f"The transparent yellow overlay marks the predicted **{class_name.lower()}** region."
+    )
+    return result, message, state
+
+
 def reset_doctor_targets(state):
     """Resets doctor manual targets and reverts back to the base auto-detected nuclei."""
     if state is None or state.get("image") is None:
@@ -507,7 +646,7 @@ def reset_doctor_targets(state):
     state["doctor_targets"] = []
     
     result = render_medsam_display(image_rgb, auto_mask, [])
-    info = "Doctor manual targets reset. Base auto-detected nuclei preserved. Click any nucleus to target again!"
+    info = "Doctor manual targets reset. Base auto-detected nuclei preserved. Circle or click any nucleus to target again!"
     return result, info, state
 
 
@@ -526,7 +665,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         Upload a cervical-cell or histology slide and select your model:
         - **Herlev (EffNet-B7)**: Multi-class semantic segmentation (**Background**, **Cytoplasm**, **Nucleus**).
         - **MedSAM (ViT-B)**: Medical foundation model that **detects nuclei across the whole slide**. 
-          Doctors can **manually target any missed nuclei** by clicking on them: the system rigorously isolates and rounds off the nucleus, remembers all targeted points, and shows **previous + new doctor targets together**!
+          Doctors can **manually target any missed nuclei** by circling around them with the brush tool (brush size adjustable): the system predicts and refines the exact rounded nucleus, remembers all targeted points, and shows **previous + new doctor targets together**!
         """
     )
 
@@ -551,14 +690,17 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
             image_mode="RGB",
         )
 
-        output_image = gr.Image(
-            label="2. Segmentation result — click to manually target missed nuclei",
+        output_image = gr.ImageEditor(
+            label="2. Segmentation result — circle missed nuclei with brush",
             type="numpy",
-            interactive=False,  # Display only so cursor does not hide or clear image
+            brush=gr.Brush(default_size=10, colors=["#ff0000", "#ffff00", "#00ff00"], default_color="#ff0000"),
+            eraser=gr.Eraser(),
+            transforms=(),
+            sources=(),
         )
 
     selected_info = gr.Markdown(
-        "Upload an image first. Then click 'Run Segmentation' or click on the image to target nuclei."
+        "Upload an image first. Then click 'Run Segmentation' or use the brush to circle missed nuclei."
     )
 
     with gr.Row():
@@ -581,6 +723,12 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     model_choice.change(
         fn=predict_image,
         inputs=[input_image, model_choice],
+        outputs=[output_image, selected_info, state],
+    )
+
+    output_image.change(
+        fn=target_drawn_circle,
+        inputs=[output_image, state],
         outputs=[output_image, selected_info, state],
     )
 
