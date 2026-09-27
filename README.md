@@ -71,3 +71,7 @@ Open your browser at:
 http://127.0.0.1:7860
 ```
 A sample cytology image is included in `samples/sample_cell.png` for quick testing.
+
+---
+
+<p align="center"><sub>Developed by Harsh Malakar, Anurag Dey Sarkar, and Morris Bhagat as a team</sub></p>

@@ -1,15 +1,79 @@
 import os
 import cv2
 import threading
+import time
+import tempfile
+import uuid
+from PIL import Image
 import numpy as np
 import torch
 import gradio as gr
+from gradio.components.image_editor import ImageEditor, FileData
 import segmentation_models_pytorch as smp
 
 try:
     from segment_anything import sam_model_registry, SamPredictor
 except ImportError:
     sam_model_registry, SamPredictor = None, None
+
+# ─────────────────────────────────────────────────────────────
+# Resilient Image I/O for Windows File-Locking & Async Uploads
+# ─────────────────────────────────────────────────────────────
+_orig_pil_open = Image.open
+
+def _resilient_pil_open(fp, mode="r", formats=None):
+    if isinstance(fp, (str, os.PathLike)):
+        for _ in range(25):
+            try:
+                if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                    im = _orig_pil_open(fp, mode=mode, formats=formats)
+                    _ = im.size
+                    return im
+            except Exception:
+                pass
+            time.sleep(0.04)
+    return _orig_pil_open(fp, mode=mode, formats=formats)
+
+Image.open = _resilient_pil_open
+
+_orig_convert_and_format = ImageEditor.convert_and_format_image
+
+def _safe_convert_and_format(self, file):
+    if file is None:
+        return None
+    if isinstance(file, FileData) and getattr(file, "path", None):
+        for _ in range(25):
+            try:
+                if os.path.exists(file.path) and os.path.getsize(file.path) > 0:
+                    return _orig_convert_and_format(self, file)
+            except Exception:
+                pass
+            time.sleep(0.04)
+        try:
+            return _orig_convert_and_format(self, file)
+        except Exception:
+            return None
+    return _orig_convert_and_format(self, file)
+
+ImageEditor.convert_and_format_image = _safe_convert_and_format
+
+_orig_imageeditor_preprocess = ImageEditor.preprocess
+
+def _safe_imageeditor_preprocess(self, payload):
+    for attempt in range(3):
+        try:
+            return _orig_imageeditor_preprocess(self, payload)
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(0.1)
+            else:
+                return {
+                    "background": None,
+                    "layers": [],
+                    "composite": None
+                }
+
+ImageEditor.preprocess = _safe_imageeditor_preprocess
 
 # ─────────────────────────────────────────────────────────────
 # Settings & Paths
@@ -132,6 +196,13 @@ def prewarm_medsam_image(image_rgb):
 # ─────────────────────────────────────────────────────────────
 # Image helpers
 # ─────────────────────────────────────────────────────────────
+def robust_image(img_array):
+    """Saves image to a unique path to avoid Gradio temp file race conditions and black canvas."""
+    img_array = np.ascontiguousarray(img_array)
+    path = os.path.join(tempfile.gettempdir(), f"herlev_{uuid.uuid4().hex}.png")
+    Image.fromarray(img_array).save(path)
+    return {"background": path, "layers": [], "composite": path}
+
 def colorize_mask(mask):
     """Convert label IDs 0/1/2 into an RGB segmentation image."""
     colored = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
@@ -317,6 +388,41 @@ def render_medsam_display(image_rgb, combined_mask, doctor_targets=None):
 # ─────────────────────────────────────────────────────────────
 # Model inference
 # ─────────────────────────────────────────────────────────────
+def load_image(image_rgb, model_choice):
+    """Loads the image without running segmentation. Pre-warms MedSAM if selected."""
+    if image_rgb is None:
+        return None, "Upload an image first.", None
+
+    if image_rgb.ndim == 2:
+        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+
+    if image_rgb.shape[-1] == 4:
+        image_rgb = image_rgb[:, :, :3]
+
+    image_rgb = image_rgb.astype(np.uint8)
+    h, w = image_rgb.shape[:2]
+    
+    if "MedSAM" in model_choice:
+        prewarm_medsam_image(image_rgb)
+        
+    combined_mask = np.zeros((h, w), dtype=bool)
+    state = {
+        "image": image_rgb,
+        "auto_mask": combined_mask.copy(),
+        "mask": combined_mask,
+        "doctor_targets": [],
+        "model": "MedSAM" if "MedSAM" in model_choice else "Herlev"
+    }
+    
+    info = (
+        "### Image Loaded Successfully\n\n"
+        f"- **Model**: `{model_choice}`\n"
+        "- Click **'Run Whole-Slide Segmentation'** below to auto-detect.\n"
+        "- Or, use the brush tool / click directly to manually target nuclei right now!"
+    )
+    
+    return robust_image(image_rgb), info, state
+
 def predict_image(image_rgb, model_choice):
     """
     Runs segmentation based on model selection:
@@ -336,73 +442,8 @@ def predict_image(image_rgb, model_choice):
     image_rgb = image_rgb.astype(np.uint8)
     h, w = image_rgb.shape[:2]
 
-    if model_choice == "MedSAM (Manual Only)":
-        prewarm_medsam_image(image_rgb)
-        combined_mask = np.zeros((h, w), dtype=bool)
-        info = (
-            "### MedSAM: **Manual Selection Mode**\n\n"
-            "- Ready! Use the brush tool to circle around any nucleus to predict and select it."
-        )
-        state = {
-            "image": image_rgb,
-            "auto_mask": combined_mask.copy(),
-            "mask": combined_mask,
-            "doctor_targets": [],
-            "model": "MedSAM"
-        }
-        return {"background": image_rgb, "layers": [], "composite": image_rgb}, info, state
-
-    if model_choice == "MedSAM (ViT-B)":
-        if medsam_predictor is None:
-            return image_rgb, "Error: MedSAM model failed to load.", None
-        
-        ensure_medsam_image(image_rgb)
-
-        # Detect candidate nuclei across the entire slide
-        boxes = detect_all_nuclei_boxes(image_rgb)
-        combined_mask = np.zeros((h, w), dtype=bool)
-        auto_count = 0
-        
-        if len(boxes) > 0:
-            try:
-                with torch.inference_mode():
-                    boxes_tensor = torch.tensor(boxes, device=device)
-                    transformed_boxes = medsam_predictor.transform.apply_boxes_torch(boxes_tensor, (h, w))
-                    masks, scores, _ = medsam_predictor.predict_torch(
-                        point_coords=None,
-                        point_labels=None,
-                        boxes=transformed_boxes,
-                        multimask_output=False
-                    )
-                    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    for m in masks:
-                        m_np = m[0].cpu().numpy().astype(np.uint8)
-                        m_smooth = cv2.morphologyEx(m_np, cv2.MORPH_CLOSE, k_close)
-                        combined_mask = combined_mask | (m_smooth > 0)
-                    auto_count = len(boxes)
-            except Exception as e:
-                print("MedSAM whole-slide batch exception:", e)
-        
-        result = render_medsam_display(image_rgb, combined_mask)
-        
-        cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        total_nuclei = len(cnts_tot)
-        
-        info = (
-            f"### MedSAM: **{total_nuclei} Nuclei Segmented Across Whole Slide**\n\n"
-            f"- Automatically identified and rounded off **{auto_count} candidate nuclei** across top, center, and bottom fields.\n"
-            f"- **Doctor Targeting Active**: Click or circle directly on any missed nucleus in the image.\n"
-            f"- Every targeted point will be remembered, rigorously segmented, and merged with existing data!"
-        )
-            
-        state = {
-            "image": image_rgb,
-            "auto_mask": combined_mask.copy(),
-            "mask": combined_mask,
-            "doctor_targets": [],
-            "model": "MedSAM"
-        }
-        return {"background": result, "layers": [], "composite": result}, info, state
+    if model_choice == "MedSAM":
+        return load_image(image_rgb, model_choice)
 
     # Herlev inference
     x, original_h, original_w = preprocess(image_rgb)
@@ -433,7 +474,7 @@ def predict_image(image_rgb, model_choice):
         "Red = Background | Dark blue = Cytoplasm | Light blue = Nucleus"
     )
 
-    return {"background": overlay, "layers": [], "composite": overlay}, info, state
+    return robust_image(overlay), info, state
 
 
 # ─────────────────────────────────────────────────────────────
@@ -448,32 +489,36 @@ def select_region(state, evt: gr.SelectData):
     - Displays all nuclei together with numbered markers.
     """
     if state is None or state.get("image") is None:
-        return gr.skip(), "Upload an image and run segmentation first."
+        return gr.skip(), "Upload an image and run segmentation first.", state
+
+    idx = getattr(evt, "index", None)
+    if idx is None:
+        return gr.skip(), gr.skip(), state
 
     image_rgb = state["image"].copy()
     h, w = image_rgb.shape[:2]
-    x, y = evt.index
+    x, y = idx[0], idx[1]
 
     x = max(0, min(int(x), w - 1))
     y = max(0, min(int(y), h - 1))
 
     if state.get("model") == "MedSAM":
         if medsam_predictor is None:
-            return image_rgb, "Error: MedSAM model not loaded."
+            return gr.skip(), "Error: MedSAM model not loaded.", state
 
         existing_mask = state.get("mask")
         if existing_mask is not None and existing_mask.shape == (h, w) and existing_mask[y, x]:
-            return gr.skip(), gr.skip()
+            return gr.skip(), gr.skip(), state
 
         ensure_medsam_image(image_rgb)
 
         # Rigorously segment the nucleus at the clicked location
         try:
-            with torch.inference_mode():
+            with _medsam_lock, torch.inference_mode():
                 new_nuc_mask, (cx, cy), conf = target_nucleus_rigorous(medsam_predictor, image_rgb, x, y)
         except Exception as e:
             print("MedSAM targeting error:", e)
-            return image_rgb, f"MedSAM targeting error: {e}"
+            return gr.skip(), f"MedSAM targeting error: {e}", state
 
         # Remember doctor target point
         doctor_targets = state.get("doctor_targets", [])
@@ -503,7 +548,7 @@ def select_region(state, evt: gr.SelectData):
             f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
             f"Showing **previous auto-detected nuclei + all doctor-targeted nuclei** together in transparent yellow with green rounded boundaries!"
         )
-        return {"background": result, "layers": [], "composite": result}, message
+        return robust_image(result), message, state
 
     # Herlev interaction
     mask = state["mask"]
@@ -535,7 +580,7 @@ def select_region(state, evt: gr.SelectData):
         f"The transparent yellow overlay marks the predicted **{class_name.lower()}** region."
     )
 
-    return {"background": result, "layers": [], "composite": result}, message
+    return robust_image(result), message, state
 
 
 def target_drawn_circle(editor_data, state):
@@ -562,8 +607,22 @@ def target_drawn_circle(editor_data, state):
     # Combine all drawn stroke layers
     stroke_mask = np.zeros((h, w), dtype=bool)
     for l in layers:
-        if isinstance(l, np.ndarray) and l.ndim == 3 and l.shape[2] == 4:
-            stroke_mask = stroke_mask | (l[:, :, 3] > 0)
+        l_img = None
+        if isinstance(l, str):
+            for _ in range(10):
+                l_img = cv2.imread(l, cv2.IMREAD_UNCHANGED)
+                if l_img is not None:
+                    break
+                time.sleep(0.04)
+        elif isinstance(l, np.ndarray):
+            l_img = l
+        elif hasattr(l, "convert"):
+            l_img = np.array(l)
+
+        if l_img is not None and l_img.ndim == 3 and l_img.shape[2] == 4:
+            if l_img.shape[:2] != (h, w):
+                l_img = cv2.resize(l_img, (w, h), interpolation=cv2.INTER_NEAREST)
+            stroke_mask = stroke_mask | (l_img[:, :, 3] > 0)
 
     if not stroke_mask.any():
         return gr.skip(), gr.skip(), gr.skip()
@@ -585,7 +644,7 @@ def target_drawn_circle(editor_data, state):
 
         for c in cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
-            if bw < 5 or bh < 5:
+            if bw < 4 or bh < 4:
                 continue
 
             pad = 4
@@ -594,20 +653,20 @@ def target_drawn_circle(editor_data, state):
             x2 = min(w, bx + bw + pad)
             y2 = min(h, by + bh + pad)
 
-            # Find the true nucleus core (highest hematoxylin optical density / darkest green channel)
+            # Find the true nucleus core (highest hematoxylin optical density)
             patch = image_rgb[y1:y2, x1:x2]
             if patch.size == 0:
                 continue
             min_val, _, min_loc, _ = cv2.minMaxLoc(patch[:, :, 1])
-            if min_val > 215:
-                continue
-            cx = x1 + min_loc[0]
-            cy = y1 + min_loc[1]
+            if min_val < 240:
+                cx = x1 + min_loc[0]
+                cy = y1 + min_loc[1]
+            else:
+                cx = bx + bw // 2
+                cy = by + bh // 2
 
-            # Fast skip if this nucleus is already segmented or already recorded
-            if combined_mask[cy, cx]:
-                continue
-            if any((cx - tx)**2 + (cy - ty)**2 < 144 for tx, ty in doctor_targets):
+            # Avoid re-adding if exactly at an already recorded doctor target point
+            if any((cx - tx)**2 + (cy - ty)**2 < 25 for tx, ty in doctor_targets):
                 continue
 
             # Ensure image embeddings are ready (computed once per image, then cached)
@@ -615,7 +674,7 @@ def target_drawn_circle(editor_data, state):
 
             box_prompt = np.array([x1, y1, x2, y2])
             try:
-                with torch.inference_mode():
+                with _medsam_lock, torch.inference_mode():
                     masks, scores, _ = medsam_predictor.predict(
                         box=box_prompt,
                         point_coords=np.array([[cx, cy]]),
@@ -630,7 +689,7 @@ def target_drawn_circle(editor_data, state):
                 print("MedSAM brush circling error:", e)
 
         if newly_added == 0:
-            return gr.skip(), gr.skip(), gr.skip()
+            return gr.skip(), f"Covered — `{len(doctor_targets)}` doctor targets remembered.", state
 
         state["mask"] = combined_mask
         state["doctor_targets"] = doctor_targets
@@ -649,7 +708,7 @@ def target_drawn_circle(editor_data, state):
             f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
             f"Vague circled shapes are now **perfected into rounded nuclei** and shown with previous auto-detected nuclei in yellow with green contours!"
         )
-        return {"background": result, "layers": [], "composite": result}, message, state
+        return robust_image(result), message, state
 
     # Herlev fallback if user draws with Herlev active
     cnts, _ = cv2.findContours(stroke_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -687,7 +746,7 @@ def target_drawn_circle(editor_data, state):
         f"- Selected area: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of image)\n\n"
         f"The transparent yellow overlay marks the predicted **{class_name.lower()}** region."
     )
-    return {"background": result, "layers": [], "composite": result}, message, state
+    return robust_image(result), message, state
 
 
 def reset_doctor_targets(state):
@@ -701,7 +760,7 @@ def reset_doctor_targets(state):
     
     result = render_medsam_display(image_rgb, auto_mask, [])
     info = "Doctor manual targets reset. Base auto-detected nuclei preserved. Circle or click any nucleus to target again!"
-    return {"background": result, "layers": [], "composite": result}, info, state
+    return robust_image(result), info, state
 
 
 def clear_app():
@@ -718,19 +777,18 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
         Upload a cervical-cell or histology slide and select your model:
         - **Herlev (EffNet-B7)**: Multi-class semantic segmentation (**Background**, **Cytoplasm**, **Nucleus**).
-        - **MedSAM (ViT-B)**: Whole-slide automatic nucleus detection + brush manual refinement.
-        - **MedSAM (Manual Only)**: Pure manual mode — image is displayed as-is, circle any nucleus with the brush tool to predict and select it.
+        - **MedSAM**: Pure manual mode — image is displayed as-is, circle any nucleus with the brush tool to predict and select it.
         """
     )
 
     model_status = (
-        f"Models Available: `EfficientNet-B7 Noisy Student + FPN` & `MedSAM (ViT-B)`  \n"
+        f"Models Available: `EfficientNet-B7 Noisy Student + FPN` & `MedSAM`  \n"
         f"Device: `{device}`  \n"
     )
     gr.Markdown(model_status)
 
     model_choice = gr.Radio(
-        choices=["Herlev (EffNet-B7)", "MedSAM (ViT-B)", "MedSAM (Manual Only)"],
+        choices=["Herlev (EffNet-B7)", "MedSAM"],
         value="Herlev (EffNet-B7)",
         label="Select Model"
     )
@@ -746,7 +804,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
         output_image = gr.ImageEditor(
             label="2. Segmentation result — circle missed nuclei with brush",
-            type="numpy",
+            type="filepath",
             brush=gr.Brush(default_size=10, colors=["#ff0000", "#ffff00", "#00ff00"], default_color="#ff0000"),
             eraser=gr.Eraser(),
             transforms=(),
@@ -769,13 +827,13 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     )
 
     input_image.change(
-        fn=predict_image,
+        fn=load_image,
         inputs=[input_image, model_choice],
         outputs=[output_image, selected_info, state],
     )
 
     model_choice.change(
-        fn=predict_image,
+        fn=load_image,
         inputs=[input_image, model_choice],
         outputs=[output_image, selected_info, state],
     )
@@ -789,13 +847,13 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     output_image.select(
         fn=select_region,
         inputs=state,
-        outputs=[output_image, selected_info],
+        outputs=[output_image, selected_info, state],
     )
 
     input_image.select(
         fn=select_region,
         inputs=state,
-        outputs=[output_image, selected_info],
+        outputs=[output_image, selected_info, state],
     )
 
     reset_doc_button.click(
@@ -824,4 +882,4 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     )
 
 if __name__ == "__main__":
-    demo.launch(inbrowser=True, server_port=7860)
+    demo.queue(default_concurrency_limit=1).launch(inbrowser=True, server_port=7860)
