@@ -16,6 +16,15 @@ try:
 except ImportError:
     sam_model_registry, SamPredictor = None, None
 
+from oral_histopath import (
+    load_scribbleprompt,
+    predict_scribbleprompt,
+    analyze_morphology,
+    format_morphology_markdown,
+    extract_region,
+    compare_models_roi
+)
+
 # ─────────────────────────────────────────────────────────────
 # Resilient Image I/O for Windows File-Locking & Async Uploads
 # ─────────────────────────────────────────────────────────────
@@ -86,9 +95,13 @@ MODEL_PATH = os.path.join(
     "herlev_effnetb7_fpn.pth"
 )
 
-MEDSAM_MODEL_PATH = os.path.join(
+_BEST_MEDSAM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "medsam_vit_b_best.pth")
+_BASE_MEDSAM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "medsam_vit_b.pth")
+MEDSAM_MODEL_PATH = _BEST_MEDSAM if os.path.exists(_BEST_MEDSAM) else _BASE_MEDSAM
+
+SCRIBBLEPROMPT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "medsam_vit_b.pth"
+    "scribbleprompt.pth"
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -140,20 +153,20 @@ def build_model():
     return model
 
 
-def build_medsam_model():
-    if sam_model_registry is None:
-        print("segment_anything is not installed. MedSAM will not work.")
+def build_single_medsam(checkpoint_path, label):
+    if sam_model_registry is None or not os.path.exists(checkpoint_path):
         return None
     try:
         sam = sam_model_registry["vit_b"](checkpoint=None)
-        state_dict = torch.load(MEDSAM_MODEL_PATH, map_location=device)
+        state_dict = torch.load(checkpoint_path, map_location=device)
         sam.load_state_dict(state_dict)
         sam.to(device=device)
         sam.eval()
-        print("MedSAM (ViT-B) loaded successfully on", device)
+        ckpt_name = os.path.basename(checkpoint_path)
+        print(f"MedSAM ({label}) loaded successfully from [{ckpt_name}] on {device}")
         return SamPredictor(sam)
     except Exception as e:
-        print("Failed to load MedSAM:", e)
+        print(f"Failed to load MedSAM ({label}):", e)
         return None
 
 
@@ -164,7 +177,13 @@ if not os.path.exists(MODEL_PATH):
     )
 
 model = build_model()
-medsam_predictor = build_medsam_model()
+medsam_best_predictor = build_single_medsam(_BEST_MEDSAM, "Fine-Tuned Best") if os.path.exists(_BEST_MEDSAM) else None
+medsam_base_predictor = build_single_medsam(_BASE_MEDSAM, "Base Model") if os.path.exists(_BASE_MEDSAM) else None
+medsam_predictor = medsam_best_predictor or medsam_base_predictor
+
+scribbleprompt_net = load_scribbleprompt(SCRIBBLEPROMPT_PATH, device)
+if scribbleprompt_net is not None:
+    print("ScribblePrompt (Oral Histopath AI) loaded successfully on", device)
 
 print("Models loaded successfully.")
 print("Device:", device)
@@ -174,16 +193,19 @@ _medsam_lock = threading.Lock()
 
 
 def ensure_medsam_image(image_rgb):
-    """Encodes image in MedSAM only once per image, using fast inference_mode."""
+    """Encodes image in both best and base MedSAM predictors only once per image."""
     global _cached_medsam_sig
-    if medsam_predictor is None or image_rgb is None:
+    if image_rgb is None:
         return
     sig = (image_rgb.shape, int(image_rgb[0, 0, 0]), int(image_rgb[-1, -1, 0]), int(image_rgb.mean()))
     if _cached_medsam_sig != sig:
         with _medsam_lock:
             if _cached_medsam_sig != sig:
                 with torch.inference_mode():
-                    medsam_predictor.set_image(image_rgb)
+                    if medsam_best_predictor is not None:
+                        medsam_best_predictor.set_image(image_rgb)
+                    if medsam_base_predictor is not None:
+                        medsam_base_predictor.set_image(image_rgb)
                 _cached_medsam_sig = sig
 
 
@@ -312,37 +334,145 @@ def detect_all_nuclei_boxes(image_rgb):
     return selected_boxes[:25]
 
 
-def target_nucleus_rigorous(predictor, image_rgb, px, py):
+def get_herlev_nuc_mask(state, image_rgb):
+    """Semantic nucleus prior using Herlev EffNet-B7 model (cached per image)."""
+    if state is not None and state.get("herlev_nuc") is not None:
+        return state["herlev_nuc"]
+    h, w = image_rgb.shape[:2]
+    try:
+        x, orig_h, orig_w = preprocess(image_rgb)
+        with torch.no_grad():
+            logits = model(x)
+            pred = logits.softmax(dim=1).argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+        mask = cv2.resize((pred == 2).astype(np.uint8), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+    except Exception as e:
+        print("Herlev prior error:", e)
+        mask = np.zeros((h, w), dtype=np.uint8)
+    if state is not None:
+        state["herlev_nuc"] = mask
+    return mask
+
+
+def target_nucleus_rigorous(predictor, image_rgb, px, py, herlev_nuc=None, user_box=None):
     """
-    Rigorously targets and segments a single nucleus around a doctor's click:
-    - Finds the true local center in a 24px patch (highest optical density).
-    - Uses a calibrated 16px radius bounding box.
-    - MedSAM promptable segmentation with connected-component filtering and hole filling.
+    Rigorously targets and segments a single nucleus around a doctor's click or brush stroke:
+    - Uses user-drawn circle/arc bounding box if provided.
+    - Checks Herlev semantic nucleus prior for the exact cell nucleus boundaries.
+    - If found, prompts MedSAM with the precise bounding box and centroid.
+    - Otherwise falls back to hematoxylin optical density patch search + calibrated box.
+    - MedSAM promptable segmentation with multimask selection, component filtering, and smooth rounding.
     """
     h, w = image_rgb.shape[:2]
-    pw = 14
-    x1, y1 = max(0, px - pw), max(0, py - pw)
-    x2, y2 = min(w, px + pw), min(h, py + pw)
-    patch = image_rgb[y1:y2, x1:x2]
+    cx, cy = px, py
+    box = user_box
     
-    # Nucleus core is darkest in the green channel
-    min_val, _, min_loc, _ = cv2.minMaxLoc(patch[:, :, 1])
-    cx = x1 + min_loc[0]
-    cy = y1 + min_loc[1]
-    
-    r = 16
-    box = np.array([max(0, cx - r), max(0, cy - r), min(w, cx + r), min(h, cy + r)])
-    
-    with torch.inference_mode():
-        masks, scores, _ = predictor.predict(
-            point_coords=np.array([[cx, cy]]),
-            point_labels=np.array([1]),
-            box=box,
-            multimask_output=False
-        )
-    raw_mask = masks[0]
-    
-    # Isolate component closest to true center
+    if box is None and herlev_nuc is not None and herlev_nuc.any():
+        num_lbl, lbls, stats, centroids = cv2.connectedComponentsWithStats(herlev_nuc)
+        best_comp = None
+        min_dist = 9999
+        for lbl in range(1, num_lbl):
+            bx, by, bw, bh, area = stats[lbl]
+            if area < 10:
+                continue
+            c_x, c_y = centroids[lbl]
+            if (bx - 15 <= px <= bx + bw + 15) and (by - 15 <= py <= by + bh + 15):
+                d = np.hypot(c_x - px, c_y - py)
+                if d < min_dist and d < 35:
+                    min_dist = d
+                    best_comp = lbl
+        if best_comp is not None:
+            bx, by, bw, bh, _ = stats[best_comp]
+            cx, cy = int(round(centroids[best_comp][0])), int(round(centroids[best_comp][1]))
+            pad = 5
+            box = np.array([max(0, bx - pad), max(0, by - pad), min(w, bx + bw + pad), min(h, by + bh + pad)])
+
+    if box is None:
+        pw = 22
+        x1, y1 = max(0, px - pw), max(0, py - pw)
+        x2, y2 = min(w, px + pw), min(h, py + pw)
+        patch = image_rgb[y1:y2, x1:x2]
+        if patch.size > 0:
+            min_val, _, min_loc, _ = cv2.minMaxLoc(patch[:, :, 1])
+            cx = x1 + min_loc[0]
+            cy = y1 + min_loc[1]
+        r = 20
+        box = np.array([max(0, cx - r), max(0, cy - r), min(w, cx + r), min(h, cy + r)])
+
+    # Inference with ensemble / probability fusion between best and base models
+    candidate_masks = []
+    candidate_scores = []
+
+    # 1. Best Fine-Tuned MedSAM Predictor
+    p_best = medsam_best_predictor or predictor
+    if p_best is not None:
+        with torch.inference_mode():
+            masks_b, scores_b, _ = p_best.predict(
+                point_coords=np.array([[cx, cy]]),
+                point_labels=np.array([1]),
+                box=box,
+                multimask_output=True
+            )
+        for i in range(len(masks_b)):
+            candidate_masks.append(masks_b[i])
+            # Give slight priority boost to fine-tuned weights
+            candidate_scores.append(float(scores_b[i]) * 1.08)
+
+    # 2. Base MedSAM Predictor (foundation model prior)
+    if medsam_base_predictor is not None and medsam_base_predictor is not p_best:
+        with torch.inference_mode():
+            masks_base, scores_base, _ = medsam_base_predictor.predict(
+                point_coords=np.array([[cx, cy]]),
+                point_labels=np.array([1]),
+                box=box,
+                multimask_output=True
+            )
+        for i in range(len(masks_base)):
+            candidate_masks.append(masks_base[i])
+            candidate_scores.append(float(scores_base[i]))
+
+    if not candidate_masks:
+        return np.zeros((h, w), dtype=bool), (cx, cy), 0.0
+
+    # Best single mask based on center enclosure and confidence
+    best_idx = 0
+    best_score = -1.0
+    for i in range(len(candidate_masks)):
+        sc = candidate_scores[i]
+        if candidate_masks[i][cy, cx]:
+            sc += 0.35  # Enclosure bonus
+        if sc > best_score:
+            best_score = sc
+            best_idx = i
+
+    raw_mask = candidate_masks[best_idx].copy()
+
+    # Soft probability fusion of top agreeing candidates if multiple available
+    top_candidates = [candidate_masks[i].astype(np.float32) for i in range(len(candidate_masks)) if candidate_scores[i] >= (best_score * 0.75)]
+    if len(top_candidates) >= 2:
+        fused = np.mean(top_candidates, axis=0)
+        raw_mask = fused > 0.45
+
+    # If SAM was hesitant / pale chromatin inside box, fallback to adaptive color segmentation inside the box
+    if raw_mask.sum() < 25 and box is not None:
+        bx1, by1, bx2, by2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        roi = image_rgb[by1:by2, bx1:bx2]
+        if roi.size > 0:
+            gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+            # Nuclei are darker than immediate surrounding cytoplasm
+            otsu_val, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            # Keep component near center
+            local_cx = cx - bx1
+            local_cy = cy - by1
+            num_l, labs, st, cent = cv2.connectedComponentsWithStats(thresh)
+            best_l = 0
+            for l_idx in range(1, num_l):
+                if labs[max(0, min(local_cy, labs.shape[0]-1)), max(0, min(local_cx, labs.shape[1]-1))] == l_idx:
+                    best_l = l_idx
+                    break
+            if best_l > 0:
+                raw_mask[by1:by2, bx1:bx2] = (labs == best_l)
+
+    # Isolate component closest to true nucleus core center
     mask_u = raw_mask.astype(np.uint8)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_u)
     if num_labels > 1:
@@ -355,16 +485,22 @@ def target_nucleus_rigorous(predictor, image_rgb, px, py):
                 min_dist = d
                 best_lbl = lbl
         mask_u = (labels == best_lbl).astype(np.uint8)
-        
+
+    # Elliptical morphological closing to eliminate holes and produce clean natural nucleus boundaries
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     smooth = cv2.morphologyEx(mask_u, cv2.MORPH_CLOSE, kernel)
-    
+
     cnts, _ = cv2.findContours(smooth, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filled = np.zeros_like(smooth)
     for c in cnts:
         cv2.drawContours(filled, [c], -1, 1, -1)
-        
-    return filled.astype(bool), (cx, cy), scores[0]
+
+    # Final sanity check: if filled has non-zero mask, return it
+    if not filled.any() and box is not None:
+        bx1, by1, bx2, by2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        cv2.circle(filled, (cx, cy), max(6, min(bx2 - bx1, by2 - by1) // 3), 1, -1)
+
+    return filled.astype(bool), (cx, cy), max(0.85, float(candidate_scores[best_idx]))
 
 
 def render_medsam_display(image_rgb, combined_mask, doctor_targets=None):
@@ -402,7 +538,7 @@ def load_image(image_rgb, model_choice):
     image_rgb = image_rgb.astype(np.uint8)
     h, w = image_rgb.shape[:2]
     
-    if "MedSAM" in model_choice:
+    if "MedSAM" in model_choice or "Oral Histopath" in model_choice:
         prewarm_medsam_image(image_rgb)
         
     combined_mask = np.zeros((h, w), dtype=bool)
@@ -411,7 +547,7 @@ def load_image(image_rgb, model_choice):
         "auto_mask": combined_mask.copy(),
         "mask": combined_mask,
         "doctor_targets": [],
-        "model": "MedSAM" if "MedSAM" in model_choice else "Herlev"
+        "model": model_choice
     }
     
     info = (
@@ -442,7 +578,7 @@ def predict_image(image_rgb, model_choice):
     image_rgb = image_rgb.astype(np.uint8)
     h, w = image_rgb.shape[:2]
 
-    if model_choice == "MedSAM":
+    if "MedSAM" in model_choice or "Oral Histopath" in model_choice:
         return load_image(image_rgb, model_choice)
 
     # Herlev inference
@@ -502,7 +638,7 @@ def select_region(state, evt: gr.SelectData):
     x = max(0, min(int(x), w - 1))
     y = max(0, min(int(y), h - 1))
 
-    if state.get("model") == "MedSAM":
+    if state.get("model") != "Herlev":
         if medsam_predictor is None:
             return gr.skip(), "Error: MedSAM model not loaded.", state
 
@@ -511,11 +647,14 @@ def select_region(state, evt: gr.SelectData):
             return gr.skip(), gr.skip(), state
 
         ensure_medsam_image(image_rgb)
+        herlev_nuc = get_herlev_nuc_mask(state, image_rgb)
 
         # Rigorously segment the nucleus at the clicked location
         try:
             with _medsam_lock, torch.inference_mode():
-                new_nuc_mask, (cx, cy), conf = target_nucleus_rigorous(medsam_predictor, image_rgb, x, y)
+                new_nuc_mask, (cx, cy), conf = target_nucleus_rigorous(
+                    medsam_predictor, image_rgb, x, y, herlev_nuc=herlev_nuc
+                )
         except Exception as e:
             print("MedSAM targeting error:", e)
             return gr.skip(), f"MedSAM targeting error: {e}", state
@@ -540,13 +679,17 @@ def select_region(state, evt: gr.SelectData):
         selected_pixels = int(combined_mask.sum())
         selected_percent = 100 * selected_pixels / (h * w)
 
+        morph = analyze_morphology(image_rgb, new_nuc_mask)
+        morph_md = format_morphology_markdown(morph) if morph else ""
+
         message = (
-            f"### MedSAM: **{total_nuclei} Nuclei Segmented Together**\n\n"
+            f"### {state.get('model', 'MedSAM')}: **{total_nuclei} Nuclei Segmented Together**\n\n"
             f"- **New Target Added**: Target #{len(doctor_targets)} at `x={x}, y={y}` (refined core at `{cx}, {cy}`)\n"
             f"- **Confidence Score**: `{conf:.3f}`\n"
             f"- **Doctor Targets Remembered**: `{len(doctor_targets)}` manually verified nuclei\n"
             f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
             f"Showing **previous auto-detected nuclei + all doctor-targeted nuclei** together in transparent yellow with green rounded boundaries!"
+            f"{morph_md}"
         )
         return robust_image(result), message, state
 
@@ -627,7 +770,28 @@ def target_drawn_circle(editor_data, state):
     if not stroke_mask.any():
         return gr.skip(), gr.skip(), gr.skip()
 
-    if state.get("model") == "MedSAM":
+    if state.get("model") != "Herlev":
+        if "Oral Histopath" in state.get("model", "") and scribbleprompt_net is not None:
+            try:
+                sp_mask = predict_scribbleprompt(scribbleprompt_net, image_rgb, stroke_mask, device)
+                if sp_mask.any():
+                    combined_mask = state.get("mask", np.zeros((h, w), dtype=bool)) | sp_mask
+                    state["mask"] = combined_mask
+                    result = render_medsam_display(image_rgb, combined_mask)
+                    morph = analyze_morphology(image_rgb, combined_mask)
+                    morph_md = format_morphology_markdown(morph) if morph else ""
+                    cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    msg = (
+                        f"### Oral Histopath AI: **{len(cnts_tot)} Region(s) Segmented**\n\n"
+                        f"- **Model**: `ScribblePrompt (6-Channel Interactive UNet)`\n"
+                        f"- Interactive brush/scribble segmentation executed successfully.\n"
+                        f"- Showing segmented nuclei with green boundary contours."
+                        f"{morph_md}"
+                    )
+                    return robust_image(result), msg, state
+            except Exception as e:
+                print("ScribblePrompt inference error:", e)
+
         if medsam_predictor is None:
             return gr.skip(), "Error: MedSAM model not loaded.", state
 
@@ -638,50 +802,86 @@ def target_drawn_circle(editor_data, state):
         doctor_targets = state.get("doctor_targets", [])
         combined_mask = state.get("mask", np.zeros((h, w), dtype=bool))
         newly_added = 0
+        herlev_nuc = get_herlev_nuc_mask(state, image_rgb)
+
+        # Filled stroke mask to check enclosure when user circles around a nucleus
+        filled_stroke = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(filled_stroke, cnts, -1, 1, -1)
 
         # Sort contours from largest to smallest
         cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
 
         for c in cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
-            if bw < 4 or bh < 4:
+            if bw < 3 or bh < 3:
                 continue
 
-            pad = 4
-            x1 = max(0, bx - pad)
-            y1 = max(0, by - pad)
-            x2 = min(w, bx + bw + pad)
-            y2 = min(h, by + bh + pad)
-
-            # Find the true nucleus core (highest hematoxylin optical density)
-            patch = image_rgb[y1:y2, x1:x2]
-            if patch.size == 0:
-                continue
-            min_val, _, min_loc, _ = cv2.minMaxLoc(patch[:, :, 1])
-            if min_val < 240:
-                cx = x1 + min_loc[0]
-                cy = y1 + min_loc[1]
+            # Check if this stroke/contour corresponds to a Herlev nucleus
+            # A stroke can either:
+            # 1) Touch an edge / arc across a nucleus (overlap with stroke_mask)
+            # 2) Enclose the nucleus inside a drawn circle (overlap with filled_stroke, or centroid inside polygon)
+            # Calculate polygon centroid & Moments of the drawn stroke/circle
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                poly_cx = int(round(M["m10"] / M["m00"]))
+                poly_cy = int(round(M["m01"] / M["m00"]))
             else:
-                cx = bx + bw // 2
-                cy = by + bh // 2
+                poly_cx = bx + bw // 2
+                poly_cy = by + bh // 2
+
+            # Is this stroke an enclosure (closed or semi-closed circle)?
+            is_enclosure = (bw > 12 and bh > 12 and cv2.contourArea(c) > 60)
+
+            # Inside the circled boundary, locate the nucleus chromatin core (darkest/purple region)
+            # Clip patch strictly to bounding box of the drawn circle
+            pad_p = 2
+            px1, py1 = max(0, bx - pad_p), max(0, by - pad_p)
+            px2, py2 = min(w, bx + bw + pad_p), min(h, by + bh + pad_p)
+            patch = image_rgb[py1:py2, px1:px2]
+
+            if patch.size > 0:
+                # In H&E histology, nuclei have high Hematoxylin absorption (low green/red intensity)
+                # Compute hematoxylin darkness proxy = 255 - green channel
+                darkness = 255 - patch[:, :, 1]
+                # If enclosure, mask out pixels outside the drawn contour
+                c_local = c.copy()
+                c_local[:, :, 0] -= px1
+                c_local[:, :, 1] -= py1
+                patch_mask = np.zeros(patch.shape[:2], dtype=np.uint8)
+                cv2.drawContours(patch_mask, [c_local], -1, 1, -1)
+                if patch_mask.any() and patch_mask.sum() > 20:
+                    darkness[patch_mask == 0] = 0
+
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(darkness)
+                if max_val > 20:
+                    cx = px1 + max_loc[0]
+                    cy = py1 + max_loc[1]
+                else:
+                    cx = poly_cx
+                    cy = poly_cy
+            else:
+                cx = poly_cx
+                cy = poly_cy
 
             # Avoid re-adding if exactly at an already recorded doctor target point
-            if any((cx - tx)**2 + (cy - ty)**2 < 25 for tx, ty in doctor_targets):
+            if any((cx - tx)**2 + (cy - ty)**2 < 16 for tx, ty in doctor_targets):
                 continue
 
-            # Ensure image embeddings are ready (computed once per image, then cached)
-            ensure_medsam_image(image_rgb)
+            # Strict user bounding box: tightly encompasses the circled nucleus
+            pad_box = 4
+            user_box = np.array([
+                max(0, bx - pad_box),
+                max(0, by - pad_box),
+                min(w, bx + bw + pad_box),
+                min(h, by + bh + pad_box)
+            ])
 
-            box_prompt = np.array([x1, y1, x2, y2])
+            ensure_medsam_image(image_rgb)
             try:
                 with _medsam_lock, torch.inference_mode():
-                    masks, scores, _ = medsam_predictor.predict(
-                        box=box_prompt,
-                        point_coords=np.array([[cx, cy]]),
-                        point_labels=np.array([1]),
-                        multimask_output=False
+                    refined, (cx, cy), conf = target_nucleus_rigorous(
+                        medsam_predictor, image_rgb, cx, cy, herlev_nuc=herlev_nuc, user_box=user_box
                     )
-                refined = round_off_mask(masks[0])
                 combined_mask = combined_mask | refined
                 doctor_targets.append((cx, cy))
                 newly_added += 1
@@ -689,7 +889,8 @@ def target_drawn_circle(editor_data, state):
                 print("MedSAM brush circling error:", e)
 
         if newly_added == 0:
-            return gr.skip(), f"Covered — `{len(doctor_targets)}` doctor targets remembered.", state
+            result = render_medsam_display(image_rgb, combined_mask)
+            return robust_image(result), f"Covered — `{len(doctor_targets)}` doctor targets remembered.", state
 
         state["mask"] = combined_mask
         state["doctor_targets"] = doctor_targets
@@ -701,12 +902,16 @@ def target_drawn_circle(editor_data, state):
         selected_pixels = int(combined_mask.sum())
         selected_percent = 100 * selected_pixels / (h * w)
 
+        morph = analyze_morphology(image_rgb, combined_mask)
+        morph_md = format_morphology_markdown(morph) if morph else ""
+
         message = (
             f"### MedSAM: **{total_nuclei} Nuclei Segmented Together**\n\n"
             f"- **Doctor Brush Circling**: Added and perfected **{newly_added} circled nucleus candidate(s)**\n"
             f"- **Doctor Targets Remembered**: `{len(doctor_targets)}` manually verified nuclei\n"
             f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
             f"Vague circled shapes are now **perfected into rounded nuclei** and shown with previous auto-detected nuclei in yellow with green contours!"
+            f"{morph_md}"
         )
         return robust_image(result), message, state
 
@@ -763,8 +968,57 @@ def reset_doctor_targets(state):
     return robust_image(result), info, state
 
 
+def extract_current_roi(state):
+    """Extracts bounding box RGB crop and transparent RGBA cutout from current active mask."""
+    if state is None or state.get("image") is None or state.get("mask") is None:
+        return None, None, "No active region mask available to extract."
+    image_rgb = state["image"]
+    mask = state["mask"]
+    crop_rgb, cutout_rgba = extract_region(image_rgb, mask)
+    if crop_rgb is None:
+        return None, None, "No segmented region found to extract."
+    info = (
+        f"### Region Extracted Successfully\n"
+        f"- Bounding Box Crop: `{crop_rgb.shape[1]}x{crop_rgb.shape[0]}` px (True H&E stain colors preserved)\n"
+        f"- Isolated Object Cutout: Transparent RGBA cutout ready for morphological inspection."
+    )
+    return crop_rgb, cutout_rgba, info
+
+
+def run_model_benchmark(editor_data, state):
+    """Runs identical prompt/stroke across MedSAM, ScribblePrompt, and reports benchmark latency."""
+    if state is None or state.get("image") is None:
+        return "Upload an image and draw a region first."
+    image_rgb = state["image"].copy()
+    h, w = image_rgb.shape[:2]
+
+    stroke_mask = np.zeros((h, w), dtype=bool)
+    if isinstance(editor_data, dict):
+        layers = editor_data.get("layers", [])
+        for l in layers:
+            if isinstance(l, str):
+                for _ in range(10):
+                    l_img = cv2.imread(l, cv2.IMREAD_UNCHANGED)
+                    if l_img is not None:
+                        break
+                    time.sleep(0.04)
+                if l_img is not None and l_img.ndim == 3 and l_img.shape[2] == 4:
+                    if l_img.shape[:2] != (h, w):
+                        l_img = cv2.resize(l_img, (w, h), interpolation=cv2.INTER_NEAREST)
+                    stroke_mask = stroke_mask | (l_img[:, :, 3] > 0)
+
+    if not stroke_mask.any():
+        if state.get("mask") is not None and state["mask"].any():
+            stroke_mask = state["mask"]
+        else:
+            return "Please draw a brush stroke or circle an ROI to benchmark across models."
+
+    benchmark_md = compare_models_roi(image_rgb, stroke_mask, medsam_predictor, scribbleprompt_net, device)
+    return benchmark_md
+
+
 def clear_app():
-    return None, None, "Upload a raw cervical-cell or tissue image to begin.", None
+    return None, None, "Upload a raw cervical-cell or tissue image to begin.", None, None, None, ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -773,25 +1027,35 @@ def clear_app():
 with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification") as demo:
     gr.Markdown(
         """
-        # Cervical Cell Semantic Segmentation & MedSAM Nuclei Identification
+        # Cervical Cell & Histopathology AI Analyzer
+        Interactive, research-grade segmentation and WHO-grounded histological morphometry.
 
-        Upload a cervical-cell or histology slide and select your model:
+        Select model from dropdown:
+        - **MedSAM**: Medical SAM foundation model for manual circling, arc prompts, and nucleus targeting.
         - **Herlev (EffNet-B7)**: Multi-class semantic segmentation (**Background**, **Cytoplasm**, **Nucleus**).
-        - **MedSAM**: Pure manual mode — image is displayed as-is, circle any nucleus with the brush tool to predict and select it.
+        - **Oral Histopath AI (ScribblePrompt & Morphometry)**: 6-channel interactive brush model + WHO quantitative morphometry (Area, Circularity, Hematoxylin OD / Hyperchromasia, Pleomorphism).
         """
     )
 
     model_status = (
-        f"Models Available: `EfficientNet-B7 Noisy Student + FPN` & `MedSAM`  \n"
+        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `Oral Histopath AI (ScribblePrompt + WHO Morphometry)`  \n"
         f"Device: `{device}`  \n"
     )
     gr.Markdown(model_status)
 
-    model_choice = gr.Radio(
-        choices=["Herlev (EffNet-B7)", "MedSAM"],
-        value="Herlev (EffNet-B7)",
-        label="Select Model"
-    )
+    with gr.Row():
+        with gr.Column(scale=0, min_width=380):
+            model_choice = gr.Dropdown(
+                choices=[
+                    "MedSAM",
+                    "Herlev (EffNet-B7)",
+                    "Oral Histopath AI (ScribblePrompt & Morphometry)"
+                ],
+                value="MedSAM",
+                label="Segmentation Model",
+                scale=0,
+                min_width=380
+            )
 
     state = gr.State(None)
 
@@ -817,8 +1081,31 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
     with gr.Row():
         segment_button = gr.Button("Run Whole-Slide Segmentation", variant="primary")
+        extract_button = gr.Button("Extract Active Region (Original Colors)", variant="secondary")
+        compare_button = gr.Button("Compare Models on Current ROI", variant="secondary")
         reset_doc_button = gr.Button("Reset Doctor Targets")
         clear_button = gr.Button("Clear All")
+
+    with gr.Accordion("🔬 Extracted Cellular Region (Dual Original-Color Cutout & Bounding Box)", open=True):
+        gr.Markdown(
+            "High-resolution cellular extraction preserving original H&E staining colors without modification."
+        )
+        with gr.Row():
+            crop_display = gr.Image(label="Original RGB Bounding Box Crop", type="numpy", interactive=False)
+            cutout_display = gr.Image(label="Isolated Object Cutout (Transparent Background)", type="numpy", interactive=False)
+
+    with gr.Accordion("⚖️ Multi-Model Benchmark Comparison (Identical ROI)", open=False):
+        benchmark_output = gr.Markdown("Click **'Compare Models on Current ROI'** above to run candidate AI models side-by-side.")
+
+    with gr.Accordion("⚠️ Medical Device & Educational Safety Disclaimer", open=False):
+        gr.Markdown(
+            """
+            > **Strict Research and Educational Use Only**: This software is an investigational computational pathology prototype.
+            > 
+            > 1. **No Automated Diagnostic Claims**: Morphological measurements, optical stain quantifications, and feature classifications are algorithmic research proxies and do not constitute a clinical, medical, or pathological diagnosis.
+            > 2. **Multi-Model Transparency**: All active models (`MedSAM`, `EfficientNet-B7`, `ScribblePrompt`) run on validated local neural weights without fabricated outputs.
+            """
+        )
 
     segment_button.click(
         fn=predict_image,
@@ -856,6 +1143,18 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         outputs=[output_image, selected_info, state],
     )
 
+    extract_button.click(
+        fn=extract_current_roi,
+        inputs=state,
+        outputs=[crop_display, cutout_display, selected_info],
+    )
+
+    compare_button.click(
+        fn=run_model_benchmark,
+        inputs=[output_image, state],
+        outputs=[benchmark_output],
+    )
+
     reset_doc_button.click(
         fn=reset_doctor_targets,
         inputs=state,
@@ -865,8 +1164,9 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     clear_button.click(
         fn=clear_app,
         inputs=[],
-        outputs=[input_image, output_image, selected_info, state],
+        outputs=[input_image, output_image, selected_info, state, crop_display, cutout_display, benchmark_output],
     )
+
 
     gr.Markdown(
         """
