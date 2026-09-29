@@ -16,9 +16,12 @@ try:
 except ImportError:
     sam_model_registry, SamPredictor = None, None
 
+# [Oral Histopath AI - Commented out for now]
+# from oral_histopath import (
+#     load_scribbleprompt,
+#     predict_scribbleprompt,
+# )
 from oral_histopath import (
-    load_scribbleprompt,
-    predict_scribbleprompt,
     analyze_morphology,
     format_morphology_markdown,
     extract_region,
@@ -189,9 +192,11 @@ medsam_best_predictor = build_single_medsam(_BEST_MEDSAM, "Fine-Tuned Best") if 
 medsam_base_predictor = build_single_medsam(_BASE_MEDSAM, "Base Model") if os.path.exists(_BASE_MEDSAM) else None
 medsam_predictor = medsam_best_predictor or medsam_base_predictor
 
-scribbleprompt_net = load_scribbleprompt(SCRIBBLEPROMPT_PATH, device)
-if scribbleprompt_net is not None:
-    print("ScribblePrompt (Oral Histopath AI) loaded successfully on", device)
+# [Oral Histopath AI - Commented out for now]
+# scribbleprompt_net = load_scribbleprompt(SCRIBBLEPROMPT_PATH, device)
+# if scribbleprompt_net is not None:
+#     print("ScribblePrompt (Oral Histopath AI) loaded successfully on", device)
+scribbleprompt_net = None
 
 print("Models loaded successfully.")
 print("Device:", device)
@@ -554,7 +559,26 @@ def load_image(image_rgb, model_choice):
     image_rgb = image_rgb.astype(np.uint8)
     h, w = image_rgb.shape[:2]
     
-    if "MedSAM" in model_choice or "Oral Histopath" in model_choice:
+    if "Herlev" in str(model_choice):
+        x_herlev, orig_h, orig_w = preprocess(image_rgb)
+        with torch.no_grad():
+            logits = model(x_herlev)
+            pred_128 = torch.softmax(logits, dim=1).argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+        prediction_full = cv2.resize(pred_128, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+        overlay = make_overlay(image_rgb, prediction_full)
+        state = {
+            "image": image_rgb,
+            "mask": prediction_full,
+            "last_class": None,
+            "model": "Herlev"
+        }
+        info = (
+            "Segmentation complete. Click anywhere on the image below.\n\n"
+            "Red = Background | Dark blue = Cytoplasm | Light blue = Nucleus"
+        )
+        return robust_image(overlay), info, state
+
+    if "MedSAM" in model_choice:  # or "Oral Histopath" in model_choice:
         prewarm_medsam_image(image_rgb)
         
     combined_mask = np.zeros((h, w), dtype=bool)
@@ -594,7 +618,7 @@ def predict_image(image_rgb, model_choice):
     image_rgb = image_rgb.astype(np.uint8)
     h, w = image_rgb.shape[:2]
 
-    if "MedSAM" in model_choice or "Oral Histopath" in model_choice:
+    if "MedSAM" in model_choice:  # or "Oral Histopath" in model_choice:
         return load_image(image_rgb, model_choice)
 
     # Herlev inference
@@ -654,91 +678,95 @@ def select_region(state, evt: gr.SelectData):
     x = max(0, min(int(x), w - 1))
     y = max(0, min(int(y), h - 1))
 
-    if state.get("model") != "Herlev":
-        if medsam_predictor is None:
-            return gr.skip(), "Error: MedSAM model not loaded.", state
+    if "Herlev" in str(state.get("model", "")):
+        mask = state.get("mask")
+        if mask is None or mask.shape[:2] != (h, w) or mask.dtype == bool:
+            x_herlev, orig_h, orig_w = preprocess(image_rgb)
+            with torch.no_grad():
+                logits = model(x_herlev)
+                pred_128 = torch.softmax(logits, dim=1).argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+            mask = cv2.resize(pred_128, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+            state["mask"] = mask
 
-        existing_mask = state.get("mask")
-        if existing_mask is not None and existing_mask.shape == (h, w) and existing_mask[y, x]:
-            return gr.skip(), gr.skip(), state
+        class_id = int(mask[y, x])
+        class_name = CLASS_NAMES.get(class_id, "Unknown")
 
-        ensure_medsam_image(image_rgb)
-        herlev_nuc = get_herlev_nuc_mask(state, image_rgb)
+        result = make_overlay(image_rgb, mask, alpha=0.42)
+        selected = mask == class_id
+        yellow_layer = np.zeros_like(result)
+        yellow_layer[selected] = YELLOW
 
-        # Rigorously segment the nucleus at the clicked location
-        try:
-            with _medsam_lock, torch.inference_mode():
-                new_nuc_mask, (cx, cy), conf = target_nucleus_rigorous(
-                    medsam_predictor, image_rgb, x, y, herlev_nuc=herlev_nuc
-                )
-        except Exception as e:
-            print("MedSAM targeting error:", e)
-            return gr.skip(), f"MedSAM targeting error: {e}", state
+        result[selected] = (
+            0.52 * result[selected].astype(np.float32)
+            + 0.48 * yellow_layer[selected].astype(np.float32)
+        ).astype(np.uint8)
 
-        # Remember doctor target point
-        doctor_targets = state.get("doctor_targets", [])
-        doctor_targets.append((x, y))
-        state["doctor_targets"] = doctor_targets
-
-        # Accumulate with previous data (Purana + Naya)
-        if existing_mask is None or existing_mask.shape != (h, w):
-            combined_mask = new_nuc_mask
-        else:
-            combined_mask = existing_mask | new_nuc_mask
-        state["mask"] = combined_mask
-
-        # Render combined display
-        result = render_medsam_display(image_rgb, combined_mask)
-
-        cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        total_nuclei = len(cnts_tot)
-        selected_pixels = int(combined_mask.sum())
-        selected_percent = 100 * selected_pixels / (h * w)
-
-        morph = analyze_morphology(image_rgb, new_nuc_mask)
-        morph_md = format_morphology_markdown(morph) if morph else ""
+        selected_pixels = int(selected.sum())
+        total_pixels = int(mask.size)
+        selected_percent = 100 * selected_pixels / total_pixels
 
         message = (
-            f"### {state.get('model', 'MedSAM')}: **{total_nuclei} Nuclei Segmented Together**\n\n"
-            f"- **New Target Added**: Target #{len(doctor_targets)} at `x={x}, y={y}` (refined core at `{cx}, {cy}`)\n"
-            f"- **Confidence Score**: `{conf:.3f}`\n"
-            f"- **Doctor Targets Remembered**: `{len(doctor_targets)}` manually verified nuclei\n"
-            f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
-            f"Showing **previous auto-detected nuclei + all doctor-targeted nuclei** together in transparent yellow with green rounded boundaries!"
-            f"{morph_md}"
+            f"### Selected: **{class_name}**\n\n"
+            f"- Click position: `x={x}, y={y}`\n"
+            f"- Predicted class ID: `{class_id}`\n"
+            f"- Selected area: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of image)\n\n"
+            f"The transparent yellow overlay marks the predicted **{class_name.lower()}** region."
         )
+
         return robust_image(result), message, state
 
-    # Herlev interaction
-    mask = state["mask"]
-    class_id = int(mask[y, x])
-    class_name = CLASS_NAMES[class_id]
+    if medsam_predictor is None:
+        return gr.skip(), "Error: MedSAM model not loaded.", state
 
-    result = make_overlay(image_rgb, mask, alpha=0.42)
-    selected = mask == class_id
-    yellow_layer = np.zeros_like(result)
-    yellow_layer[selected] = YELLOW
+    existing_mask = state.get("mask")
+    if existing_mask is not None and existing_mask.shape == (h, w) and existing_mask[y, x]:
+        return gr.skip(), gr.skip(), state
 
-    result[selected] = (
-        0.52 * result[selected].astype(np.float32)
-        + 0.48 * yellow_layer[selected].astype(np.float32)
-    ).astype(np.uint8)
+    ensure_medsam_image(image_rgb)
+    herlev_nuc = get_herlev_nuc_mask(state, image_rgb)
 
-    cv2.circle(result, (x, y), 7, (255, 235, 0), -1)
-    cv2.circle(result, (x, y), 9, (0, 0, 0), 2)
+    # Rigorously segment the nucleus at the clicked location
+    try:
+        with _medsam_lock, torch.inference_mode():
+            new_nuc_mask, (cx, cy), conf = target_nucleus_rigorous(
+                medsam_predictor, image_rgb, x, y, herlev_nuc=herlev_nuc
+            )
+    except Exception as e:
+        print("MedSAM targeting error:", e)
+        return gr.skip(), f"MedSAM targeting error: {e}", state
 
-    selected_pixels = int(selected.sum())
-    total_pixels = int(mask.size)
-    selected_percent = 100 * selected_pixels / total_pixels
+    # Remember doctor target point
+    doctor_targets = state.get("doctor_targets", [])
+    doctor_targets.append((x, y))
+    state["doctor_targets"] = doctor_targets
+
+    # Accumulate with previous data (Purana + Naya)
+    if existing_mask is None or existing_mask.shape != (h, w):
+        combined_mask = new_nuc_mask
+    else:
+        combined_mask = existing_mask | new_nuc_mask
+    state["mask"] = combined_mask
+
+    # Render combined display
+    result = render_medsam_display(image_rgb, combined_mask)
+
+    cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    total_nuclei = len(cnts_tot)
+    selected_pixels = int(combined_mask.sum())
+    selected_percent = 100 * selected_pixels / (h * w)
+
+    morph = analyze_morphology(image_rgb, new_nuc_mask)
+    morph_md = format_morphology_markdown(morph) if morph else ""
 
     message = (
-        f"### Selected: **{class_name}**\n\n"
-        f"- Click position: `x={x}, y={y}`\n"
-        f"- Predicted class ID: `{class_id}`\n"
-        f"- Selected area: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of image)\n\n"
-        f"The transparent yellow overlay marks the predicted **{class_name.lower()}** region."
+        f"### {state.get('model', 'MedSAM')}: **{total_nuclei} Nuclei Segmented Together**\n\n"
+        f"- **New Target Added**: Target #{len(doctor_targets)} at `x={x}, y={y}` (refined core at `{cx}, {cy}`)\n"
+        f"- **Confidence Score**: `{conf:.3f}`\n"
+        f"- **Doctor Targets Remembered**: `{len(doctor_targets)}` manually verified nuclei\n"
+        f"- **Combined Field Area**: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of slide)\n\n"
+        f"Showing **previous auto-detected nuclei + all doctor-targeted nuclei** together in transparent yellow with green rounded boundaries!"
+        f"{morph_md}"
     )
-
     return robust_image(result), message, state
 
 
@@ -787,26 +815,27 @@ def target_drawn_circle(editor_data, state):
         return gr.skip(), gr.skip(), gr.skip()
 
     if state.get("model") != "Herlev":
-        if "Oral Histopath" in state.get("model", "") and scribbleprompt_net is not None:
-            try:
-                sp_mask = predict_scribbleprompt(scribbleprompt_net, image_rgb, stroke_mask, device)
-                if sp_mask.any():
-                    combined_mask = state.get("mask", np.zeros((h, w), dtype=bool)) | sp_mask
-                    state["mask"] = combined_mask
-                    result = render_medsam_display(image_rgb, combined_mask)
-                    morph = analyze_morphology(image_rgb, combined_mask)
-                    morph_md = format_morphology_markdown(morph) if morph else ""
-                    cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    msg = (
-                        f"### Oral Histopath AI: **{len(cnts_tot)} Region(s) Segmented**\n\n"
-                        f"- **Model**: `ScribblePrompt (6-Channel Interactive UNet)`\n"
-                        f"- Interactive brush/scribble segmentation executed successfully.\n"
-                        f"- Showing segmented nuclei with green boundary contours."
-                        f"{morph_md}"
-                    )
-                    return robust_image(result), msg, state
-            except Exception as e:
-                print("ScribblePrompt inference error:", e)
+        # [Oral Histopath AI - Commented out for now]
+        # if "Oral Histopath" in state.get("model", "") and scribbleprompt_net is not None:
+        #     try:
+        #         sp_mask = predict_scribbleprompt(scribbleprompt_net, image_rgb, stroke_mask, device)
+        #         if sp_mask.any():
+        #             combined_mask = state.get("mask", np.zeros((h, w), dtype=bool)) | sp_mask
+        #             state["mask"] = combined_mask
+        #             result = render_medsam_display(image_rgb, combined_mask)
+        #             morph = analyze_morphology(image_rgb, combined_mask)
+        #             morph_md = format_morphology_markdown(morph) if morph else ""
+        #             cnts_tot, _ = cv2.findContours(combined_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        #             msg = (
+        #                 f"### Oral Histopath AI: **{len(cnts_tot)} Region(s) Segmented**\n\n"
+        #                 f"- **Model**: `ScribblePrompt (6-Channel Interactive UNet)`\n"
+        #                 f"- Interactive brush/scribble segmentation executed successfully.\n"
+        #                 f"- Showing segmented nuclei with green boundary contours."
+        #                 f"{morph_md}"
+        #             )
+        #             return robust_image(result), msg, state
+        #     except Exception as e:
+        #         print("ScribblePrompt inference error:", e)
 
         if medsam_predictor is None:
             return gr.skip(), "Error: MedSAM model not loaded.", state
@@ -953,9 +982,6 @@ def target_drawn_circle(editor_data, state):
         + 0.48 * yellow_layer[selected].astype(np.float32)
     ).astype(np.uint8)
 
-    cv2.circle(result, (cx, cy), 7, (255, 235, 0), -1)
-    cv2.circle(result, (cx, cy), 9, (0, 0, 0), 2)
-
     selected_pixels = int(selected.sum())
     total_pixels = int(class_mask.size)
     selected_percent = 100 * selected_pixels / total_pixels
@@ -1038,6 +1064,100 @@ def clear_app():
 
 
 # ─────────────────────────────────────────────────────────────
+# Herlev Handlers (First Commit Logic & '+' Crosshair Marker)
+# ─────────────────────────────────────────────────────────────
+def predict_herlev(image_rgb):
+    """Herlev inference matching first commit logic."""
+    if image_rgb is None:
+        return None, "Upload an image first.", None
+
+    if image_rgb.ndim == 2:
+        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+    if image_rgb.shape[-1] == 4:
+        image_rgb = image_rgb[:, :, :3]
+    image_rgb = image_rgb.astype(np.uint8)
+
+    x, original_h, original_w = preprocess(image_rgb)
+
+    with torch.no_grad():
+        logits = model(x)
+        prediction_128 = torch.softmax(logits, dim=1).argmax(dim=1)[0]
+        prediction_128 = prediction_128.cpu().numpy().astype(np.uint8)
+
+    prediction_full = cv2.resize(
+        prediction_128,
+        (original_w, original_h),
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+    overlay = make_overlay(image_rgb, prediction_full)
+
+    state = {
+        "image": image_rgb,
+        "mask": prediction_full,
+        "last_class": None,
+        "model": "Herlev"
+    }
+
+    info = (
+        "Segmentation complete. Click anywhere on the image below.\n\n"
+        "Red = Background | Dark blue = Cytoplasm | Light blue = Nucleus"
+    )
+
+    return overlay, info, state
+
+
+def select_herlev_region(state, evt: gr.SelectData):
+    """
+    Herlev click callback strictly from first commit with '+' crosshair marker.
+    """
+    if state is None or state.get("image") is None:
+        return gr.skip(), "Upload an image and run segmentation first."
+
+    image_rgb = state["image"].copy()
+    h, w = image_rgb.shape[:2]
+    idx = getattr(evt, "index", None)
+    if idx is None:
+        return gr.skip(), gr.skip()
+    x, y = int(idx[0]), int(idx[1])
+
+    x = max(0, min(x, w - 1))
+    y = max(0, min(y, h - 1))
+
+    mask = state["mask"]
+    class_id = int(mask[y, x])
+    class_name = CLASS_NAMES[class_id]
+
+    result = make_overlay(image_rgb, mask, alpha=0.42)
+    selected = mask == class_id
+    yellow_layer = np.zeros_like(result)
+    yellow_layer[selected] = YELLOW
+
+    result[selected] = (
+        0.52 * result[selected].astype(np.float32)
+        + 0.48 * yellow_layer[selected].astype(np.float32)
+    ).astype(np.uint8)
+
+    selected_pixels = int(selected.sum())
+    total_pixels = int(mask.size)
+    selected_percent = 100 * selected_pixels / total_pixels
+
+    message = (
+        f"### Selected: **{class_name}**\n\n"
+        f"- Click position: `x={x}, y={y}`\n"
+        f"- Predicted class ID: `{class_id}`\n"
+        f"- Selected area: `{selected_pixels:,}` pixels ({selected_percent:.1f}% of image)\n\n"
+        f"The transparent yellow overlay marks the predicted **{class_name.lower()}** region."
+    )
+
+    return result, message
+
+
+def clear_herlev():
+    return None, None, "Upload a raw cervical-cell image to begin.", None
+
+
+# ─────────────────────────────────────────────────────────────
 # HoVer-Net Handlers (Graham et al., 2019)
 # ─────────────────────────────────────────────────────────────
 def load_hovernet_image(image_rgb):
@@ -1059,36 +1179,22 @@ def load_hovernet_image(image_rgb):
         "- Click **'Run HoVer-Net Segmentation & Classification'** below to execute the full HoVer-Net pipeline (Graham et al., 2019).\n"
         "- All touching/clustered nuclei will be separated using horizontal & vertical distance maps and classified into 4 CoNSeP/PanNuke phenotypes."
     )
-    return robust_image(image_rgb), info, state, None
+    return image_rgb, info, state, None
 
 
-def run_hovernet_analysis(editor_data, state):
+def run_hovernet_analysis(image_rgb, state):
     if state is None or state.get("image") is None:
-        return gr.skip(), "Please upload a histology image first.", state, None
+        if image_rgb is None:
+            return gr.skip(), "Please upload a histology image first.", state, None
+        if image_rgb.ndim == 2:
+            image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+        if image_rgb.shape[-1] == 4:
+            image_rgb = image_rgb[:, :, :3]
+        image_rgb = image_rgb.astype(np.uint8)
+        state = {"image": image_rgb}
 
     image_rgb = state["image"]
-    h, w = image_rgb.shape[:2]
-
-    # Optional ROI brush stroke filter
-    roi_mask = None
-    if isinstance(editor_data, dict):
-        layers = editor_data.get("layers", [])
-        for l in layers:
-            if isinstance(l, str):
-                for _ in range(10):
-                    l_img = cv2.imread(l, cv2.IMREAD_UNCHANGED)
-                    if l_img is not None:
-                        break
-                    time.sleep(0.04)
-                if l_img is not None and l_img.ndim == 3 and l_img.shape[2] == 4:
-                    if l_img.shape[:2] != (h, w):
-                        l_img = cv2.resize(l_img, (w, h), interpolation=cv2.INTER_NEAREST)
-                    if roi_mask is None:
-                        roi_mask = np.zeros((h, w), dtype=bool)
-                    roi_mask = roi_mask | (l_img[:, :, 3] > 0)
-
-    # Run HoVer-Net pipeline
-    result_data = run_hovernet_segmentation(image_rgb, roi_mask=roi_mask)
+    result_data = run_hovernet_segmentation(image_rgb)
     state["result_data"] = result_data
     state["selected_id"] = None
 
@@ -1096,7 +1202,7 @@ def run_hovernet_analysis(editor_data, state):
     hover_maps_rgb = render_hover_maps_rgb(result_data["h_map"], result_data["v_map"])
     report_md = format_hovernet_markdown(result_data)
 
-    return robust_image(overlay), report_md, state, robust_image(hover_maps_rgb)
+    return overlay, report_md, state, hover_maps_rgb
 
 
 def select_hovernet_nucleus(state, evt: gr.SelectData):
@@ -1136,7 +1242,7 @@ def select_hovernet_nucleus(state, evt: gr.SelectData):
     overlay = render_hovernet_display(image_rgb, result_data, selected_id=state["selected_id"])
     report_md = format_hovernet_markdown(result_data, selected_instance=selected_inst)
 
-    return robust_image(overlay), report_md, state
+    return overlay, report_md, state
 
 
 def extract_hovernet_nucleus(state):
@@ -1175,46 +1281,47 @@ def clear_hovernet_workspace():
 # ─────────────────────────────────────────────────────────────
 # Web UI
 # ─────────────────────────────────────────────────────────────
-ORAL_HISTOPATH_HTML = """
-<div style="width: 100%; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); border: 1px solid #cbd5e1; margin-top: 6px;">
-    <div style="background: #0f172a; color: white; padding: 12px 18px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #334155;">
-        <div style="display: flex; align-items: center; gap: 10px;">
-            <span style="display: inline-block; width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; box-shadow: 0 0 8px #22c55e;"></span>
-            <span style="font-weight: 600; font-size: 15px; letter-spacing: 0.02em;">Oral Histopathology AI Analyzer (OPMD / OSCC)</span>
-            <span style="background: #1e293b; color: #94a3b8; font-size: 12px; padding: 2px 8px; border-radius: 4px; border: 1px solid #334155;">WHO 5th Ed. Morphometry &amp; Interactive ScribblePrompt</span>
-        </div>
-        <div style="display: flex; align-items: center; gap: 12px;">
-            <span style="font-size: 12px; color: #94a3b8;">Port: 8000 (Active)</span>
-            <a href="http://127.0.0.1:8000" target="_blank" style="color: #38bdf8; font-size: 13px; text-decoration: none; font-weight: 500; display: inline-flex; align-items: center; gap: 5px; background: rgba(56, 189, 248, 0.12); padding: 5px 12px; border-radius: 6px; border: 1px solid rgba(56, 189, 248, 0.35);">
-                Open in Full Window ↗
-            </a>
-        </div>
-    </div>
-    <iframe src="http://127.0.0.1:8000" style="width: 100%; height: 88vh; min-height: 820px; border: none; background: #ffffff;"></iframe>
-</div>
-"""
-
-def ensure_oral_backend():
-    """Ensures Oral Histopath AI backend server is running on http://127.0.0.1:8000"""
-    import urllib.request
-    import subprocess
-    import sys
-    try:
-        urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=1.5)
-        print("Oral Histopath AI backend verified active on http://127.0.0.1:8000")
-        return
-    except Exception:
-        pass
-
-    backend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oral_histopath_ai", "backend")
-    if os.path.exists(backend_dir):
-        print("Launching Oral Histopath AI backend on http://127.0.0.1:8000...")
-        subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"],
-            cwd=backend_dir,
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        )
-        time.sleep(2)
+# [Oral Histopath AI - Commented out for now]
+# ORAL_HISTOPATH_HTML = """
+# <div style="width: 100%; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); border: 1px solid #cbd5e1; margin-top: 6px;">
+#     <div style="background: #0f172a; color: white; padding: 12px 18px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #334155;">
+#         <div style="display: flex; align-items: center; gap: 10px;">
+#             <span style="display: inline-block; width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; box-shadow: 0 0 8px #22c55e;"></span>
+#             <span style="font-weight: 600; font-size: 15px; letter-spacing: 0.02em;">Oral Histopathology AI Analyzer (OPMD / OSCC)</span>
+#             <span style="background: #1e293b; color: #94a3b8; font-size: 12px; padding: 2px 8px; border-radius: 4px; border: 1px solid #334155;">WHO 5th Ed. Morphometry &amp; Interactive ScribblePrompt</span>
+#         </div>
+#         <div style="display: flex; align-items: center; gap: 12px;">
+#             <span style="font-size: 12px; color: #94a3b8;">Port: 8000 (Active)</span>
+#             <a href="http://127.0.0.1:8000" target="_blank" style="color: #38bdf8; font-size: 13px; text-decoration: none; font-weight: 500; display: inline-flex; align-items: center; gap: 5px; background: rgba(56, 189, 248, 0.12); padding: 5px 12px; border-radius: 6px; border: 1px solid rgba(56, 189, 248, 0.35);">
+#                 Open in Full Window ↗
+#             </a>
+#         </div>
+#     </div>
+#     <iframe src="http://127.0.0.1:8000" style="width: 100%; height: 88vh; min-height: 820px; border: none; background: #ffffff;"></iframe>
+# </div>
+# """
+# 
+# def ensure_oral_backend():
+#     """Ensures Oral Histopath AI backend server is running on http://127.0.0.1:8000"""
+#     import urllib.request
+#     import subprocess
+#     import sys
+#     try:
+#         urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=1.5)
+#         print("Oral Histopath AI backend verified active on http://127.0.0.1:8000")
+#         return
+#     except Exception:
+#         pass
+# 
+#     backend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oral_histopath_ai", "backend")
+#     if os.path.exists(backend_dir):
+#         print("Launching Oral Histopath AI backend on http://127.0.0.1:8000...")
+#         subprocess.Popen(
+#             [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"],
+#             cwd=backend_dir,
+#             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+#         )
+#         time.sleep(2)
 
 
 with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification") as demo:
@@ -1226,13 +1333,13 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         Select model from dropdown:
         - **MedSAM**: Medical SAM foundation model for manual circling, arc prompts, and nucleus targeting.
         - **Herlev (EffNet-B7)**: Multi-class semantic segmentation (**Background**, **Cytoplasm**, **Nucleus**).
-        - **Oral Histopath AI (ScribblePrompt & Morphometry)**: 6-channel interactive brush model + WHO quantitative morphometry (Area, Circularity, Hematoxylin OD / Hyperchromasia, Pleomorphism).
+        # - **Oral Histopath AI (ScribblePrompt & Morphometry)**: [Commented out for now]
         - **HoVer-Net**: Simultaneous nuclear instance segmentation & phenotypic classification using horizontal/vertical distance maps (Graham et al., 2019).
         """
     )
 
     model_status = (
-        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `Oral Histopath AI (ScribblePrompt)` | `HoVer-Net (PanNuke/CoNSeP)`  \n"
+        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `HoVer-Net (PanNuke/CoNSeP)`  \n"
         f"Device: `{device}`  \n"
     )
     gr.Markdown(model_status)
@@ -1243,7 +1350,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                 choices=[
                     "MedSAM",
                     "Herlev (EffNet-B7)",
-                    "Oral Histopath AI (ScribblePrompt & Morphometry)",
+                    # "Oral Histopath AI (ScribblePrompt & Morphometry)",  # [Commented out for now]
                     "HoVer-Net (Nuclear Instance Segmentation & Classification)"
                 ],
                 value="MedSAM",
@@ -1254,8 +1361,8 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
     state = gr.State(None)
 
-    # 1. Primary Container: MedSAM & Herlev (Unchanged UI & Workflows)
-    with gr.Column(visible=True) as herlev_medsam_container:
+    # 1. Primary Container: MedSAM (With Doctor Brush & Circling Workflow)
+    with gr.Column(visible=True) as medsam_container:
         with gr.Row():
             input_image = gr.Image(
                 label="1. Upload raw cervical-cell / histology slide image",
@@ -1306,22 +1413,47 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
         gr.Markdown(
             """
-            ### Colour legend (Herlev)
-            - Red: Background
-            - Dark blue: Cytoplasm
-            - Light blue: Nucleus
-            - Transparent yellow: Region selected by your click
-
             ### Colour legend (MedSAM)
             - Transparent yellow + Green boundary: All identified & rounded-off nuclei
             """
         )
 
-    # 2. Oral Histopath AI Container: Same-to-Same Original Application View
-    with gr.Column(visible=False) as oral_histopath_container:
-        gr.HTML(ORAL_HISTOPATH_HTML)
+    # 2. Herlev Container: Strictly First Commit UI & Manual '+' Selection (No Brush)
+    herlev_state = gr.State(None)
+    with gr.Column(visible=False) as herlev_container:
+        with gr.Row():
+            herlev_input_image = gr.Image(
+                label="1. Upload raw cervical-cell image",
+                type="numpy",
+                image_mode="RGB",
+            )
 
-    # 3. HoVer-Net Container: Simultaneous Instance Segmentation & Phenotypic Classification
+            herlev_output_image = gr.Image(
+                label="2. Predicted segmentation — click here to select/add nuclei",
+                type="numpy",
+                interactive=False,  # Display only so cursor does not hide or clear image
+            )
+
+        herlev_selected_info = gr.Markdown(
+            "Upload an image first. Then click 'Run Segmentation' or click on the predicted segmentation image."
+        )
+
+        with gr.Row():
+            herlev_segment_button = gr.Button("Run Segmentation", variant="primary")
+            herlev_clear_button = gr.Button("Clear All")
+
+        gr.Markdown(
+            """
+            ### Colour legend (Herlev)
+            - Red: Background
+            - Dark blue: Cytoplasm
+            - Light blue: Nucleus
+            - Transparent yellow: Region selected by your click
+            """
+        )
+
+    # 3. HoVer-Net Container: Simultaneous Instance Segmentation & Phenotypic Classification (No Brush)
+    hover_state = gr.State(None)
     with gr.Column(visible=False) as hovernet_container:
         gr.Markdown(
             r"""
@@ -1336,13 +1468,10 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                 type="numpy",
                 image_mode="RGB",
             )
-            hover_output_image = gr.ImageEditor(
-                label="2. HoVer-Net Result (Click any nucleus to inspect; brush to focus ROI)",
-                type="filepath",
-                brush=gr.Brush(default_size=10, colors=["#ef4444", "#3b82f6", "#10b981", "#f59e0b"], default_color="#ef4444"),
-                eraser=gr.Eraser(),
-                transforms=(),
-                sources=(),
+            hover_output_image = gr.Image(
+                label="2. HoVer-Net Result (Click any nucleus to inspect)",
+                type="numpy",
+                interactive=False,
             )
 
         hover_selected_info = gr.Markdown(
@@ -1375,30 +1504,24 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
             """
         )
 
-    hover_state = gr.State(None)
+    def switch_model_view(choice):
+        is_medsam = ("MedSAM" in str(choice))
+        is_herlev = ("Herlev" in str(choice))
+        is_hover = ("HoVer-Net" in str(choice))
 
-    def switch_model_view(choice, current_img):
-        is_oral = "Oral Histopath" in str(choice)
-        is_hover = "HoVer-Net" in str(choice)
-        is_herlev_medsam = not is_oral and not is_hover
-
-        img_res, msg_res, state_res = load_image(current_img, choice)
         return (
-            gr.update(visible=is_herlev_medsam),
-            gr.update(visible=is_oral),
+            gr.update(visible=is_medsam),
+            gr.update(visible=is_herlev),
             gr.update(visible=is_hover),
-            img_res,
-            msg_res,
-            state_res
         )
 
     model_choice.change(
         fn=switch_model_view,
-        inputs=[model_choice, input_image],
-        outputs=[herlev_medsam_container, oral_histopath_container, hovernet_container, output_image, selected_info, state],
+        inputs=[model_choice],
+        outputs=[medsam_container, herlev_container, hovernet_container],
     )
 
-    # MedSAM & Herlev Events (Unchanged)
+    # MedSAM Events (Unchanged)
     segment_button.click(
         fn=predict_image,
         inputs=[input_image, model_choice],
@@ -1453,10 +1576,41 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         outputs=[input_image, output_image, selected_info, state, crop_display, cutout_display, benchmark_output],
     )
 
-    # HoVer-Net Events
+    # Herlev Events (First Commit Logic & '+' Selection)
+    herlev_segment_button.click(
+        fn=predict_herlev,
+        inputs=[herlev_input_image],
+        outputs=[herlev_output_image, herlev_selected_info, herlev_state],
+    )
+
+    herlev_input_image.change(
+        fn=predict_herlev,
+        inputs=[herlev_input_image],
+        outputs=[herlev_output_image, herlev_selected_info, herlev_state],
+    )
+
+    herlev_output_image.select(
+        fn=select_herlev_region,
+        inputs=herlev_state,
+        outputs=[herlev_output_image, herlev_selected_info],
+    )
+
+    herlev_input_image.select(
+        fn=select_herlev_region,
+        inputs=herlev_state,
+        outputs=[herlev_output_image, herlev_selected_info],
+    )
+
+    herlev_clear_button.click(
+        fn=clear_herlev,
+        inputs=[],
+        outputs=[herlev_input_image, herlev_output_image, herlev_selected_info, herlev_state],
+    )
+
+    # HoVer-Net Events (Manual '+' Selection)
     hover_segment_btn.click(
         fn=run_hovernet_analysis,
-        inputs=[hover_output_image, hover_state],
+        inputs=[hover_input_image, hover_state],
         outputs=[hover_output_image, hover_selected_info, hover_state, hover_maps_display],
     )
 
@@ -1485,6 +1639,6 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     )
 
 if __name__ == "__main__":
-    ensure_oral_backend()
+    # ensure_oral_backend()  # [Oral Histopath AI commented out for now]
     demo.queue(default_concurrency_limit=1).launch(inbrowser=True, server_port=7860)
 
