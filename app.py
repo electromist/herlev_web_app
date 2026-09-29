@@ -25,6 +25,14 @@ from oral_histopath import (
     compare_models_roi
 )
 
+from hovernet import (
+    run_hovernet_segmentation,
+    render_hovernet_display,
+    render_hover_maps_rgb,
+    format_hovernet_markdown,
+    HOVERNET_CLASSES
+)
+
 # ─────────────────────────────────────────────────────────────
 # Resilient Image I/O for Windows File-Locking & Async Uploads
 # ─────────────────────────────────────────────────────────────
@@ -433,24 +441,32 @@ def target_nucleus_rigorous(predictor, image_rgb, px, py, herlev_nuc=None, user_
     if not candidate_masks:
         return np.zeros((h, w), dtype=bool), (cx, cy), 0.0
 
-    # Best single mask based on center enclosure and confidence
+    # Select the optimal mask: prioritize masks that cover the nucleus body rather than tiny sub-nucleolar peaks
     best_idx = 0
     best_score = -1.0
+    box_area = float((box[2] - box[0]) * (box[3] - box[1])) if box is not None else 1000.0
+
     for i in range(len(candidate_masks)):
+        m = candidate_masks[i]
+        m_area = float(m.sum())
         sc = candidate_scores[i]
-        if candidate_masks[i][cy, cx]:
+
+        if m[cy, cx]:
             sc += 0.35  # Enclosure bonus
+
+        # If user circled a nucleus, favor masks that occupy a realistic fraction (15% to 85%) of the box
+        if box is not None and box_area > 50:
+            coverage = m_area / box_area
+            if 0.12 <= coverage <= 0.85:
+                sc += 0.40  # Well-proportioned nucleus coverage
+            elif coverage < 0.10:
+                sc -= 0.30  # Too small (sub-nucleolar or fragment)
+
         if sc > best_score:
             best_score = sc
             best_idx = i
 
     raw_mask = candidate_masks[best_idx].copy()
-
-    # Soft probability fusion of top agreeing candidates if multiple available
-    top_candidates = [candidate_masks[i].astype(np.float32) for i in range(len(candidate_masks)) if candidate_scores[i] >= (best_score * 0.75)]
-    if len(top_candidates) >= 2:
-        fused = np.mean(top_candidates, axis=0)
-        raw_mask = fused > 0.45
 
     # If SAM was hesitant / pale chromatin inside box, fallback to adaptive color segmentation inside the box
     if raw_mask.sum() < 25 and box is not None:
@@ -1022,8 +1038,185 @@ def clear_app():
 
 
 # ─────────────────────────────────────────────────────────────
+# HoVer-Net Handlers (Graham et al., 2019)
+# ─────────────────────────────────────────────────────────────
+def load_hovernet_image(image_rgb):
+    if image_rgb is None:
+        return None, "Upload a histology / tissue image to begin.", None, None
+    if image_rgb.ndim == 2:
+        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+    if image_rgb.shape[-1] == 4:
+        image_rgb = image_rgb[:, :, :3]
+    image_rgb = image_rgb.astype(np.uint8)
+
+    state = {
+        "image": image_rgb,
+        "result_data": None,
+        "selected_id": None
+    }
+    info = (
+        "### Histology Image Loaded\n\n"
+        "- Click **'Run HoVer-Net Segmentation & Classification'** below to execute the full HoVer-Net pipeline (Graham et al., 2019).\n"
+        "- All touching/clustered nuclei will be separated using horizontal & vertical distance maps and classified into 4 CoNSeP/PanNuke phenotypes."
+    )
+    return robust_image(image_rgb), info, state, None
+
+
+def run_hovernet_analysis(editor_data, state):
+    if state is None or state.get("image") is None:
+        return gr.skip(), "Please upload a histology image first.", state, None
+
+    image_rgb = state["image"]
+    h, w = image_rgb.shape[:2]
+
+    # Optional ROI brush stroke filter
+    roi_mask = None
+    if isinstance(editor_data, dict):
+        layers = editor_data.get("layers", [])
+        for l in layers:
+            if isinstance(l, str):
+                for _ in range(10):
+                    l_img = cv2.imread(l, cv2.IMREAD_UNCHANGED)
+                    if l_img is not None:
+                        break
+                    time.sleep(0.04)
+                if l_img is not None and l_img.ndim == 3 and l_img.shape[2] == 4:
+                    if l_img.shape[:2] != (h, w):
+                        l_img = cv2.resize(l_img, (w, h), interpolation=cv2.INTER_NEAREST)
+                    if roi_mask is None:
+                        roi_mask = np.zeros((h, w), dtype=bool)
+                    roi_mask = roi_mask | (l_img[:, :, 3] > 0)
+
+    # Run HoVer-Net pipeline
+    result_data = run_hovernet_segmentation(image_rgb, roi_mask=roi_mask)
+    state["result_data"] = result_data
+    state["selected_id"] = None
+
+    overlay = render_hovernet_display(image_rgb, result_data)
+    hover_maps_rgb = render_hover_maps_rgb(result_data["h_map"], result_data["v_map"])
+    report_md = format_hovernet_markdown(result_data)
+
+    return robust_image(overlay), report_md, state, robust_image(hover_maps_rgb)
+
+
+def select_hovernet_nucleus(state, evt: gr.SelectData):
+    if state is None or state.get("image") is None or state.get("result_data") is None:
+        return gr.skip(), gr.skip(), state
+    idx = getattr(evt, "index", None)
+    if idx is None:
+        return gr.skip(), gr.skip(), state
+
+    image_rgb = state["image"]
+    result_data = state["result_data"]
+    instance_labels = result_data.get("instance_labels")
+    if instance_labels is None:
+        return gr.skip(), gr.skip(), state
+
+    h, w = image_rgb.shape[:2]
+    x = max(0, min(int(idx[0]), w - 1))
+    y = max(0, min(int(idx[1]), h - 1))
+
+    clicked_id = int(instance_labels[y, x])
+    if clicked_id == 0:
+        # Search nearest within 10 px radius
+        y1, y2 = max(0, y - 10), min(h, y + 10)
+        x1, x2 = max(0, x - 10), min(w, x + 10)
+        patch = instance_labels[y1:y2, x1:x2]
+        nonzeros = patch[patch > 0]
+        if len(nonzeros) > 0:
+            clicked_id = int(np.bincount(nonzeros).argmax())
+
+    selected_inst = None
+    for inst in result_data.get("instances", []):
+        if inst["id"] == clicked_id:
+            selected_inst = inst
+            break
+
+    state["selected_id"] = clicked_id if selected_inst else None
+    overlay = render_hovernet_display(image_rgb, result_data, selected_id=state["selected_id"])
+    report_md = format_hovernet_markdown(result_data, selected_instance=selected_inst)
+
+    return robust_image(overlay), report_md, state
+
+
+def extract_hovernet_nucleus(state):
+    if state is None or state.get("image") is None or state.get("result_data") is None:
+        return None, None, "No active HoVer-Net segmentation available."
+
+    image_rgb = state["image"]
+    result_data = state["result_data"]
+    selected_id = state.get("selected_id")
+
+    if selected_id is None:
+        instances = result_data.get("instances", [])
+        if not instances:
+            return None, None, "No nuclei segmented to extract."
+        selected_id = instances[0]["id"]
+
+    instance_labels = result_data.get("instance_labels")
+    inst_mask = (instance_labels == selected_id)
+
+    crop_rgb, cutout_rgba = extract_region(image_rgb, inst_mask)
+    if crop_rgb is None:
+        return None, None, "Could not extract selected nucleus."
+
+    info = (
+        f"### HoVer-Net Nuclear Instance #{selected_id} Extracted\n"
+        f"- **Crop Dimensions**: `{crop_rgb.shape[1]}x{crop_rgb.shape[0]}` px\n"
+        f"- True stain color preserved with isolated transparent cutout."
+    )
+    return crop_rgb, cutout_rgba, info
+
+
+def clear_hovernet_workspace():
+    return None, None, "Upload a histology image to begin.", None, None, None, None
+
+
+# ─────────────────────────────────────────────────────────────
 # Web UI
 # ─────────────────────────────────────────────────────────────
+ORAL_HISTOPATH_HTML = """
+<div style="width: 100%; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); border: 1px solid #cbd5e1; margin-top: 6px;">
+    <div style="background: #0f172a; color: white; padding: 12px 18px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #334155;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="display: inline-block; width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; box-shadow: 0 0 8px #22c55e;"></span>
+            <span style="font-weight: 600; font-size: 15px; letter-spacing: 0.02em;">Oral Histopathology AI Analyzer (OPMD / OSCC)</span>
+            <span style="background: #1e293b; color: #94a3b8; font-size: 12px; padding: 2px 8px; border-radius: 4px; border: 1px solid #334155;">WHO 5th Ed. Morphometry &amp; Interactive ScribblePrompt</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="font-size: 12px; color: #94a3b8;">Port: 8000 (Active)</span>
+            <a href="http://127.0.0.1:8000" target="_blank" style="color: #38bdf8; font-size: 13px; text-decoration: none; font-weight: 500; display: inline-flex; align-items: center; gap: 5px; background: rgba(56, 189, 248, 0.12); padding: 5px 12px; border-radius: 6px; border: 1px solid rgba(56, 189, 248, 0.35);">
+                Open in Full Window ↗
+            </a>
+        </div>
+    </div>
+    <iframe src="http://127.0.0.1:8000" style="width: 100%; height: 88vh; min-height: 820px; border: none; background: #ffffff;"></iframe>
+</div>
+"""
+
+def ensure_oral_backend():
+    """Ensures Oral Histopath AI backend server is running on http://127.0.0.1:8000"""
+    import urllib.request
+    import subprocess
+    import sys
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=1.5)
+        print("Oral Histopath AI backend verified active on http://127.0.0.1:8000")
+        return
+    except Exception:
+        pass
+
+    backend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oral_histopath_ai", "backend")
+    if os.path.exists(backend_dir):
+        print("Launching Oral Histopath AI backend on http://127.0.0.1:8000...")
+        subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"],
+            cwd=backend_dir,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        time.sleep(2)
+
+
 with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification") as demo:
     gr.Markdown(
         """
@@ -1034,11 +1227,12 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         - **MedSAM**: Medical SAM foundation model for manual circling, arc prompts, and nucleus targeting.
         - **Herlev (EffNet-B7)**: Multi-class semantic segmentation (**Background**, **Cytoplasm**, **Nucleus**).
         - **Oral Histopath AI (ScribblePrompt & Morphometry)**: 6-channel interactive brush model + WHO quantitative morphometry (Area, Circularity, Hematoxylin OD / Hyperchromasia, Pleomorphism).
+        - **HoVer-Net**: Simultaneous nuclear instance segmentation & phenotypic classification using horizontal/vertical distance maps (Graham et al., 2019).
         """
     )
 
     model_status = (
-        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `Oral Histopath AI (ScribblePrompt + WHO Morphometry)`  \n"
+        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `Oral Histopath AI (ScribblePrompt)` | `HoVer-Net (PanNuke/CoNSeP)`  \n"
         f"Device: `{device}`  \n"
     )
     gr.Markdown(model_status)
@@ -1049,7 +1243,8 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                 choices=[
                     "MedSAM",
                     "Herlev (EffNet-B7)",
-                    "Oral Histopath AI (ScribblePrompt & Morphometry)"
+                    "Oral Histopath AI (ScribblePrompt & Morphometry)",
+                    "HoVer-Net (Nuclear Instance Segmentation & Classification)"
                 ],
                 value="MedSAM",
                 label="Segmentation Model",
@@ -1059,54 +1254,151 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
     state = gr.State(None)
 
-    with gr.Row():
-        input_image = gr.Image(
-            label="1. Upload raw cervical-cell / histology slide image",
-            type="numpy",
-            image_mode="RGB",
+    # 1. Primary Container: MedSAM & Herlev (Unchanged UI & Workflows)
+    with gr.Column(visible=True) as herlev_medsam_container:
+        with gr.Row():
+            input_image = gr.Image(
+                label="1. Upload raw cervical-cell / histology slide image",
+                type="numpy",
+                image_mode="RGB",
+            )
+
+            output_image = gr.ImageEditor(
+                label="2. Segmentation result — circle missed nuclei with brush",
+                type="filepath",
+                brush=gr.Brush(default_size=10, colors=["#ff0000", "#ffff00", "#00ff00"], default_color="#ff0000"),
+                eraser=gr.Eraser(),
+                transforms=(),
+                sources=(),
+            )
+
+        selected_info = gr.Markdown(
+            "Upload an image first. Then click 'Run Segmentation' or use the brush to circle missed nuclei."
         )
 
-        output_image = gr.ImageEditor(
-            label="2. Segmentation result — circle missed nuclei with brush",
-            type="filepath",
-            brush=gr.Brush(default_size=10, colors=["#ff0000", "#ffff00", "#00ff00"], default_color="#ff0000"),
-            eraser=gr.Eraser(),
-            transforms=(),
-            sources=(),
-        )
+        with gr.Row():
+            segment_button = gr.Button("Run Whole-Slide Segmentation", variant="primary")
+            extract_button = gr.Button("Extract Active Region (Original Colors)", variant="secondary")
+            compare_button = gr.Button("Compare Models on Current ROI", variant="secondary")
+            reset_doc_button = gr.Button("Reset Doctor Targets")
+            clear_button = gr.Button("Clear All")
 
-    selected_info = gr.Markdown(
-        "Upload an image first. Then click 'Run Segmentation' or use the brush to circle missed nuclei."
-    )
+        with gr.Accordion("🔬 Extracted Cellular Region (Dual Original-Color Cutout & Bounding Box)", open=True):
+            gr.Markdown(
+                "High-resolution cellular extraction preserving original H&E staining colors without modification."
+            )
+            with gr.Row():
+                crop_display = gr.Image(label="Original RGB Bounding Box Crop", type="numpy", interactive=False)
+                cutout_display = gr.Image(label="Isolated Object Cutout (Transparent Background)", type="numpy", interactive=False)
 
-    with gr.Row():
-        segment_button = gr.Button("Run Whole-Slide Segmentation", variant="primary")
-        extract_button = gr.Button("Extract Active Region (Original Colors)", variant="secondary")
-        compare_button = gr.Button("Compare Models on Current ROI", variant="secondary")
-        reset_doc_button = gr.Button("Reset Doctor Targets")
-        clear_button = gr.Button("Clear All")
+        with gr.Accordion("⚖️ Multi-Model Benchmark Comparison (Identical ROI)", open=False):
+            benchmark_output = gr.Markdown("Click **'Compare Models on Current ROI'** above to run candidate AI models side-by-side.")
 
-    with gr.Accordion("🔬 Extracted Cellular Region (Dual Original-Color Cutout & Bounding Box)", open=True):
+        with gr.Accordion("⚠️ Medical Device & Educational Safety Disclaimer", open=False):
+            gr.Markdown(
+                """
+                > **Strict Research and Educational Use Only**: This software is an investigational computational pathology prototype.
+                > 
+                > 1. **No Automated Diagnostic Claims**: Morphological measurements, optical stain quantifications, and feature classifications are algorithmic research proxies and do not constitute a clinical, medical, or pathological diagnosis.
+                > 2. **Multi-Model Transparency**: All active models (`MedSAM`, `EfficientNet-B7`, `ScribblePrompt`, `HoVer-Net`) run on validated local neural weights without fabricated outputs.
+                """
+            )
+
         gr.Markdown(
-            "High-resolution cellular extraction preserving original H&E staining colors without modification."
+            """
+            ### Colour legend (Herlev)
+            - Red: Background
+            - Dark blue: Cytoplasm
+            - Light blue: Nucleus
+            - Transparent yellow: Region selected by your click
+
+            ### Colour legend (MedSAM)
+            - Transparent yellow + Green boundary: All identified & rounded-off nuclei
+            """
+        )
+
+    # 2. Oral Histopath AI Container: Same-to-Same Original Application View
+    with gr.Column(visible=False) as oral_histopath_container:
+        gr.HTML(ORAL_HISTOPATH_HTML)
+
+    # 3. HoVer-Net Container: Simultaneous Instance Segmentation & Phenotypic Classification
+    with gr.Column(visible=False) as hovernet_container:
+        gr.Markdown(
+            r"""
+            ### 🔬 HoVer-Net: Simultaneous Segmentation & Classification of Nuclei
+            *Based on Graham et al. (arXiv:1812.06499v5 / PanNuke & CoNSeP benchmark)*  
+            Leverages **horizontal and vertical distance maps** to their centres of mass ($S_m = \max(H_x, H_y)$) to cleanly separate touching/clustered nuclei, and simultaneously classifies each instance into **Epithelial/Tumour**, **Inflammatory (TILs)**, **Spindle-Shaped (Stroma)**, or **Miscellaneous/Mitotic**.
+            """
         )
         with gr.Row():
-            crop_display = gr.Image(label="Original RGB Bounding Box Crop", type="numpy", interactive=False)
-            cutout_display = gr.Image(label="Isolated Object Cutout (Transparent Background)", type="numpy", interactive=False)
+            hover_input_image = gr.Image(
+                label="1. Upload Multi-Tissue Histology / Cell Slide",
+                type="numpy",
+                image_mode="RGB",
+            )
+            hover_output_image = gr.ImageEditor(
+                label="2. HoVer-Net Result (Click any nucleus to inspect; brush to focus ROI)",
+                type="filepath",
+                brush=gr.Brush(default_size=10, colors=["#ef4444", "#3b82f6", "#10b981", "#f59e0b"], default_color="#ef4444"),
+                eraser=gr.Eraser(),
+                transforms=(),
+                sources=(),
+            )
 
-    with gr.Accordion("⚖️ Multi-Model Benchmark Comparison (Identical ROI)", open=False):
-        benchmark_output = gr.Markdown("Click **'Compare Models on Current ROI'** above to run candidate AI models side-by-side.")
+        hover_selected_info = gr.Markdown(
+            "Upload an image and click **'Run HoVer-Net Segmentation & Classification'** below."
+        )
 
-    with gr.Accordion("⚠️ Medical Device & Educational Safety Disclaimer", open=False):
+        with gr.Row():
+            hover_segment_btn = gr.Button("Run HoVer-Net Segmentation & Classification", variant="primary")
+            hover_extract_btn = gr.Button("Extract Selected Nucleus", variant="secondary")
+            hover_clear_btn = gr.Button("Clear Workspace")
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                with gr.Accordion("🗺️ HoVer Distance Maps Preview (Horizontal px & Vertical py Fields)", open=True):
+                    gr.Markdown("Visual encoding of horizontal & vertical instance distance maps used to split clustered nuclei:")
+                    hover_maps_display = gr.Image(label="HoVer Distance Fields", type="numpy", interactive=False)
+            with gr.Column(scale=1):
+                with gr.Accordion("🔬 Extracted Nuclear Instance (Dual RGB Crop & Transparent Cutout)", open=True):
+                    with gr.Row():
+                        hover_crop_display = gr.Image(label="RGB Crop", type="numpy", interactive=False)
+                        hover_cutout_display = gr.Image(label="Transparent Cutout", type="numpy", interactive=False)
+
         gr.Markdown(
             """
-            > **Strict Research and Educational Use Only**: This software is an investigational computational pathology prototype.
-            > 
-            > 1. **No Automated Diagnostic Claims**: Morphological measurements, optical stain quantifications, and feature classifications are algorithmic research proxies and do not constitute a clinical, medical, or pathological diagnosis.
-            > 2. **Multi-Model Transparency**: All active models (`MedSAM`, `EfficientNet-B7`, `ScribblePrompt`) run on validated local neural weights without fabricated outputs.
+            ### HoVer-Net Phenotypic Color Legend:
+            - 🔴 **Red Contour**: Epithelial / Tumour Cell Nuclei
+            - 🔵 **Blue Contour**: Inflammatory / Lymphocytes (Tumour-Infiltrating Lymphocytes / TILs)
+            - 🟢 **Green Contour**: Spindle-Shaped / Stromal / Fibroblasts
+            - 🟡 **Yellow Contour**: Miscellaneous / Mitotic Figures / Necrotic Debris
             """
         )
 
+    hover_state = gr.State(None)
+
+    def switch_model_view(choice, current_img):
+        is_oral = "Oral Histopath" in str(choice)
+        is_hover = "HoVer-Net" in str(choice)
+        is_herlev_medsam = not is_oral and not is_hover
+
+        img_res, msg_res, state_res = load_image(current_img, choice)
+        return (
+            gr.update(visible=is_herlev_medsam),
+            gr.update(visible=is_oral),
+            gr.update(visible=is_hover),
+            img_res,
+            msg_res,
+            state_res
+        )
+
+    model_choice.change(
+        fn=switch_model_view,
+        inputs=[model_choice, input_image],
+        outputs=[herlev_medsam_container, oral_histopath_container, hovernet_container, output_image, selected_info, state],
+    )
+
+    # MedSAM & Herlev Events (Unchanged)
     segment_button.click(
         fn=predict_image,
         inputs=[input_image, model_choice],
@@ -1114,12 +1406,6 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     )
 
     input_image.change(
-        fn=load_image,
-        inputs=[input_image, model_choice],
-        outputs=[output_image, selected_info, state],
-    )
-
-    model_choice.change(
         fn=load_image,
         inputs=[input_image, model_choice],
         outputs=[output_image, selected_info, state],
@@ -1167,19 +1453,38 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         outputs=[input_image, output_image, selected_info, state, crop_display, cutout_display, benchmark_output],
     )
 
+    # HoVer-Net Events
+    hover_segment_btn.click(
+        fn=run_hovernet_analysis,
+        inputs=[hover_output_image, hover_state],
+        outputs=[hover_output_image, hover_selected_info, hover_state, hover_maps_display],
+    )
 
-    gr.Markdown(
-        """
-        ### Colour legend (Herlev)
-        - Red: Background
-        - Dark blue: Cytoplasm
-        - Light blue: Nucleus
-        - Transparent yellow: Region selected by your click
+    hover_input_image.change(
+        fn=load_hovernet_image,
+        inputs=[hover_input_image],
+        outputs=[hover_output_image, hover_selected_info, hover_state, hover_maps_display],
+    )
 
-        ### Colour legend (MedSAM)
-        - Transparent yellow + Green boundary: All identified & rounded-off nuclei
-        """
+    hover_output_image.select(
+        fn=select_hovernet_nucleus,
+        inputs=hover_state,
+        outputs=[hover_output_image, hover_selected_info, hover_state],
+    )
+
+    hover_extract_btn.click(
+        fn=extract_hovernet_nucleus,
+        inputs=hover_state,
+        outputs=[hover_crop_display, hover_cutout_display, hover_selected_info],
+    )
+
+    hover_clear_btn.click(
+        fn=clear_hovernet_workspace,
+        inputs=[],
+        outputs=[hover_input_image, hover_output_image, hover_selected_info, hover_state, hover_maps_display, hover_crop_display, hover_cutout_display],
     )
 
 if __name__ == "__main__":
+    ensure_oral_backend()
     demo.queue(default_concurrency_limit=1).launch(inbrowser=True, server_port=7860)
+

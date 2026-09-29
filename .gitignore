@@ -27,3 +27,8 @@ Thumbs.db
 # Temp files & Backups
 /copy
 *.log
+*.exe
+*.msi
+*.orig_backup
+*.png
+oral_histopath_ai/installers/
