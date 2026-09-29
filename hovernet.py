@@ -124,17 +124,14 @@ def run_hovernet_segmentation(image_rgb: np.ndarray, roi_mask: np.ndarray = None
     tissue_mask = gray < 240  # discard bright slide background
 
     if tissue_mask.any():
-        # Lower threshold to capture full nucleus bodies including lighter chromatin
-        thresh_val = np.percentile(h_smooth[tissue_mask], 35)
-        np_prob = (h_smooth > max(0.08, thresh_val)).astype(np.uint8)
+        thresh_val = np.percentile(h_smooth[tissue_mask], 60)
+        np_prob = (h_smooth > max(0.12, thresh_val)).astype(np.uint8)
     else:
-        np_prob = (h_smooth > 0.08).astype(np.uint8)
+        np_prob = (h_smooth > 0.15).astype(np.uint8)
 
-    # Morphological open to remove speckles and close to ensure complete, solid nucleus bodies
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    np_clean = cv2.morphologyEx(np_prob, cv2.MORPH_OPEN, kernel_open, iterations=1)
-    np_clean = cv2.morphologyEx(np_clean, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+    # Clean small isolated noise artifacts
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    np_clean = cv2.morphologyEx(np_prob, cv2.MORPH_OPEN, kernel, iterations=1)
 
     if roi_mask is not None and roi_mask.any():
         np_clean = np_clean & roi_mask.astype(np.uint8)
@@ -281,6 +278,9 @@ def render_hovernet_display(image_rgb: np.ndarray, result_data: dict, selected_i
         if is_sel:
             cv2.drawContours(overlay, [c], -1, (255, 255, 255), 4)
             cv2.drawContours(overlay, [c], -1, (255, 235, 0), 2)
+            cx, cy = inst["center"]
+            cv2.circle(overlay, (cx, cy), 5, (255, 235, 0), -1)
+            cv2.circle(overlay, (cx, cy), 7, (0, 0, 0), 1)
         else:
             cv2.drawContours(overlay, [c], -1, color, 2)
 
