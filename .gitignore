@@ -4,6 +4,8 @@
 *.bin
 *.onnx
 *.safetensors
+*.tar
+*.npz
 herlev_effnetb7_fpn.pth
 medsam_vit_b.pth
 

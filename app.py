@@ -1158,11 +1158,11 @@ def clear_herlev():
 
 
 # ─────────────────────────────────────────────────────────────
-# HoVer-Net Handlers (Graham et al., 2019)
+# HoVer-Net Handlers (Official PanNuke Model & Cell Inspector)
 # ─────────────────────────────────────────────────────────────
 def load_hovernet_image(image_rgb):
     if image_rgb is None:
-        return None, "Upload a histology / tissue image to begin.", None, None
+        return None, "Upload a histology / tissue image to begin.", None, None, gr.update(choices=["All Cells (Overview)"], value="All Cells (Overview)")
     if image_rgb.ndim == 2:
         image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
     if image_rgb.shape[-1] == 4:
@@ -1176,16 +1176,17 @@ def load_hovernet_image(image_rgb):
     }
     info = (
         "### Histology Image Loaded\n\n"
-        "- Click **'Run HoVer-Net Segmentation & Classification'** below to execute the full HoVer-Net pipeline (Graham et al., 2019).\n"
-        "- All touching/clustered nuclei will be separated using horizontal & vertical distance maps and classified into 4 CoNSeP/PanNuke phenotypes."
+        "- Click **'Run HoVer-Net Segmentation & Classification'** below to execute the official PanNuke HoVer-Net model (Graham et al., 2019).\n"
+        "- All touching/clustered nuclei will be separated using horizontal & vertical distance maps and classified into PanNuke phenotypes.\n"
+        "- You can inspect every individual cell boundary one-by-one using the dropdown or by clicking on any nucleus."
     )
-    return image_rgb, info, state, None
+    return image_rgb, info, state, None, gr.update(choices=["All Cells (Overview)"], value="All Cells (Overview)")
 
 
 def run_hovernet_analysis(image_rgb, state):
     if state is None or state.get("image") is None:
         if image_rgb is None:
-            return gr.skip(), "Please upload a histology image first.", state, None
+            return gr.skip(), "Please upload a histology image first.", state, None, gr.skip()
         if image_rgb.ndim == 2:
             image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
         if image_rgb.shape[-1] == 4:
@@ -1202,21 +1203,69 @@ def run_hovernet_analysis(image_rgb, state):
     hover_maps_rgb = render_hover_maps_rgb(result_data["h_map"], result_data["v_map"])
     report_md = format_hovernet_markdown(result_data)
 
-    return overlay, report_md, state, hover_maps_rgb
+    instances = result_data.get("instances", [])
+    choices = ["All Cells (Overview)"] + [
+        f"Cell #{inst['id']} — {inst['class_name']} ({inst['area_um2']} µm²)"
+        for inst in instances
+    ]
+
+    return overlay, report_md, state, hover_maps_rgb, gr.update(choices=choices, value="All Cells (Overview)")
+
+
+def select_hovernet_cell_dropdown(choice, state):
+    """
+    Callback when user selects a cell from the dropdown to inspect its boundary.
+    """
+    if state is None or state.get("image") is None or state.get("result_data") is None:
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip()
+
+    image_rgb = state["image"]
+    result_data = state["result_data"]
+
+    if not choice or choice == "All Cells (Overview)":
+        state["selected_id"] = None
+        overlay = render_hovernet_display(image_rgb, result_data, selected_id=None)
+        report_md = format_hovernet_markdown(result_data, selected_instance=None)
+        return overlay, report_md, state, None, None
+
+    try:
+        cell_id = int(str(choice).split("#")[1].split(" ")[0])
+    except Exception:
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip()
+
+    selected_inst = None
+    for inst in result_data.get("instances", []):
+        if inst["id"] == cell_id:
+            selected_inst = inst
+            break
+
+    state["selected_id"] = cell_id if selected_inst else None
+    overlay = render_hovernet_display(image_rgb, result_data, selected_id=state["selected_id"])
+    report_md = format_hovernet_markdown(result_data, selected_instance=selected_inst)
+
+    crop_rgb, cutout_rgba = None, None
+    if selected_inst is not None:
+        inst_mask = (result_data.get("instance_labels") == cell_id)
+        crop_rgb, cutout_rgba = extract_region(image_rgb, inst_mask)
+
+    return overlay, report_md, state, crop_rgb, cutout_rgba
 
 
 def select_hovernet_nucleus(state, evt: gr.SelectData):
+    """
+    Callback when user clicks directly on a cell on the result image.
+    """
     if state is None or state.get("image") is None or state.get("result_data") is None:
-        return gr.skip(), gr.skip(), state
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip(), gr.skip()
     idx = getattr(evt, "index", None)
     if idx is None:
-        return gr.skip(), gr.skip(), state
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip(), gr.skip()
 
     image_rgb = state["image"]
     result_data = state["result_data"]
     instance_labels = result_data.get("instance_labels")
     if instance_labels is None:
-        return gr.skip(), gr.skip(), state
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip(), gr.skip()
 
     h, w = image_rgb.shape[:2]
     x = max(0, min(int(idx[0]), w - 1))
@@ -1242,7 +1291,14 @@ def select_hovernet_nucleus(state, evt: gr.SelectData):
     overlay = render_hovernet_display(image_rgb, result_data, selected_id=state["selected_id"])
     report_md = format_hovernet_markdown(result_data, selected_instance=selected_inst)
 
-    return overlay, report_md, state
+    crop_rgb, cutout_rgba = None, None
+    dd_val = "All Cells (Overview)"
+    if selected_inst is not None:
+        inst_mask = (instance_labels == clicked_id)
+        crop_rgb, cutout_rgba = extract_region(image_rgb, inst_mask)
+        dd_val = f"Cell #{clicked_id} — {selected_inst['class_name']} ({selected_inst['area_um2']} µm²)"
+
+    return overlay, report_md, state, crop_rgb, cutout_rgba, gr.update(value=dd_val)
 
 
 def extract_hovernet_nucleus(state):
@@ -1275,7 +1331,7 @@ def extract_hovernet_nucleus(state):
 
 
 def clear_hovernet_workspace():
-    return None, None, "Upload a histology image to begin.", None, None, None, None
+    return None, None, "Upload a histology image to begin.", None, None, None, None, gr.update(choices=["All Cells (Overview)"], value="All Cells (Overview)")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1351,7 +1407,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                     "MedSAM",
                     "Herlev (EffNet-B7)",
                     # "Oral Histopath AI (ScribblePrompt & Morphometry)",  # [Commented out for now]
-                    "HoVer-Net (Nuclear Instance Segmentation & Classification)"
+                    "HoVer-Net PanNuke (Official Model)"
                 ],
                 value="MedSAM",
                 label="Segmentation Model",
@@ -1458,8 +1514,9 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         gr.Markdown(
             r"""
             ### 🔬 HoVer-Net: Simultaneous Segmentation & Classification of Nuclei
-            *Based on Graham et al. (arXiv:1812.06499v5 / PanNuke & CoNSeP benchmark)*  
-            Leverages **horizontal and vertical distance maps** to their centres of mass ($S_m = \max(H_x, H_y)$) to cleanly separate touching/clustered nuclei, and simultaneously classifies each instance into **Epithelial/Tumour**, **Inflammatory (TILs)**, **Spindle-Shaped (Stroma)**, or **Miscellaneous/Mitotic**.
+            *Official PyTorch PanNuke-Pretrained Model (Graham et al., 2019)*  
+            Leverages **horizontal and vertical distance maps** to cleanly separate touching nuclei and simultaneously classifies each instance into **Neoplastic**, **Inflammatory (TILs)**, **Connective (Stroma)**, **Dead / Necrotic**, or **Non-Neoplastic Epithelial**.  
+            Inspect each cell's boundary one-by-one using the dropdown below or clicking any nucleus on the image!
             """
         )
         with gr.Row():
@@ -1474,13 +1531,22 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                 interactive=False,
             )
 
+        with gr.Row():
+            hover_cell_dropdown = gr.Dropdown(
+                choices=["All Cells (Overview)"],
+                value="All Cells (Overview)",
+                label="🎯 Cell Boundary Inspector (Inspect Every Cell 1-by-1)",
+                interactive=True,
+                scale=2,
+            )
+            hover_extract_btn = gr.Button("Extract Selected Nucleus", variant="secondary", scale=1)
+
         hover_selected_info = gr.Markdown(
             "Upload an image and click **'Run HoVer-Net Segmentation & Classification'** below."
         )
 
         with gr.Row():
             hover_segment_btn = gr.Button("Run HoVer-Net Segmentation & Classification", variant="primary")
-            hover_extract_btn = gr.Button("Extract Selected Nucleus", variant="secondary")
             hover_clear_btn = gr.Button("Clear Workspace")
 
         with gr.Row():
@@ -1496,11 +1562,12 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
         gr.Markdown(
             """
-            ### HoVer-Net Phenotypic Color Legend:
-            - 🔴 **Red Contour**: Epithelial / Tumour Cell Nuclei
-            - 🔵 **Blue Contour**: Inflammatory / Lymphocytes (Tumour-Infiltrating Lymphocytes / TILs)
-            - 🟢 **Green Contour**: Spindle-Shaped / Stromal / Fibroblasts
-            - 🟡 **Yellow Contour**: Miscellaneous / Mitotic Figures / Necrotic Debris
+            ### HoVer-Net Phenotypic Color Legend (Official PanNuke Classes):
+            - 🔴 **Red Outline**: Neoplastic / Tumour Cell Nuclei
+            - 🔵 **Blue Outline**: Inflammatory / Lymphocytes (Tumour-Infiltrating Lymphocytes / TILs)
+            - 🟢 **Green Outline**: Connective / Stromal / Fibroblasts
+            - 🟡 **Yellow Outline**: Dead / Necrotic Figures
+            - 🟣 **Cyan Outline**: Non-Neoplastic Epithelial Nuclei
             """
         )
 
@@ -1607,23 +1674,29 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         outputs=[herlev_input_image, herlev_output_image, herlev_selected_info, herlev_state],
     )
 
-    # HoVer-Net Events (Manual '+' Selection)
+    # HoVer-Net Events (Official PanNuke Model & Cell Boundary Inspector)
     hover_segment_btn.click(
         fn=run_hovernet_analysis,
         inputs=[hover_input_image, hover_state],
-        outputs=[hover_output_image, hover_selected_info, hover_state, hover_maps_display],
+        outputs=[hover_output_image, hover_selected_info, hover_state, hover_maps_display, hover_cell_dropdown],
     )
 
     hover_input_image.change(
         fn=load_hovernet_image,
         inputs=[hover_input_image],
-        outputs=[hover_output_image, hover_selected_info, hover_state, hover_maps_display],
+        outputs=[hover_output_image, hover_selected_info, hover_state, hover_maps_display, hover_cell_dropdown],
+    )
+
+    hover_cell_dropdown.change(
+        fn=select_hovernet_cell_dropdown,
+        inputs=[hover_cell_dropdown, hover_state],
+        outputs=[hover_output_image, hover_selected_info, hover_state, hover_crop_display, hover_cutout_display],
     )
 
     hover_output_image.select(
         fn=select_hovernet_nucleus,
         inputs=hover_state,
-        outputs=[hover_output_image, hover_selected_info, hover_state],
+        outputs=[hover_output_image, hover_selected_info, hover_state, hover_crop_display, hover_cutout_display, hover_cell_dropdown],
     )
 
     hover_extract_btn.click(
@@ -1635,7 +1708,10 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     hover_clear_btn.click(
         fn=clear_hovernet_workspace,
         inputs=[],
-        outputs=[hover_input_image, hover_output_image, hover_selected_info, hover_state, hover_maps_display, hover_crop_display, hover_cutout_display],
+        outputs=[
+            hover_input_image, hover_output_image, hover_selected_info, hover_state,
+            hover_maps_display, hover_crop_display, hover_cutout_display, hover_cell_dropdown
+        ],
     )
 
 if __name__ == "__main__":
