@@ -36,6 +36,13 @@ from hovernet import (
     HOVERNET_CLASSES
 )
 
+from celldivision import (
+    segment_whole_cell_at_point,
+    scan_candidate_dividing_cells,
+    render_celldivision_display,
+    format_celldivision_markdown
+)
+
 # ─────────────────────────────────────────────────────────────
 # Resilient Image I/O for Windows File-Locking & Async Uploads
 # ─────────────────────────────────────────────────────────────
@@ -1335,6 +1342,162 @@ def clear_hovernet_workspace():
 
 
 # ─────────────────────────────────────────────────────────────
+# Cell Division & Whole-Cell Boundary Handlers (Mitosis / CellSAM)
+# ─────────────────────────────────────────────────────────────
+def load_celldiv_image(image_rgb):
+    if image_rgb is None:
+        return None, "Upload a histology / tissue slide image to begin.", None, None, None, gr.update(choices=["Click '+' on image to select a cell"], value="Click '+' on image to select a cell")
+    if image_rgb.ndim == 2:
+        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+    if image_rgb.shape[-1] == 4:
+        image_rgb = image_rgb[:, :, :3]
+    image_rgb = image_rgb.astype(np.uint8)
+
+    ensure_medsam_image(image_rgb)
+
+    state = {
+        "image": image_rgb,
+        "instances": [],
+        "selected_id": None
+    }
+    info = (
+        "### Histology Image Loaded — Whole-Cell Boundary Mode\n\n"
+        "- Click **any cell with '+'** on the image below to segment its **Whole-Cell Boundary (Plasma Membrane & Cytoplasm)**.\n"
+        "- The system will simultaneously analyze **Cell Division & Mitosis** (Metaphase/Anaphase plates, Cytokinesis cleavage furrows, and Nuclear-to-Cytoplasmic N:C ratio).\n"
+        "- Or, click **'⚡ Auto-Scan Dividing Cells'** to locate candidate mitotic figures across the slide."
+    )
+    return image_rgb, info, state, None, None, gr.update(choices=["Click '+' on image to select a cell"], value="Click '+' on image to select a cell")
+
+
+def select_celldiv_point(state, evt: gr.SelectData):
+    """
+    Callback when user clicks '+' on any cell.
+    Segments the WHOLE CELL BOUNDARY (membrane + cytoplasm), not just the nucleus,
+    and analyzes cell division / mitosis.
+    """
+    if state is None or state.get("image") is None:
+        return gr.skip(), "Upload a slide image first.", state, gr.skip(), gr.skip(), gr.skip()
+    idx = getattr(evt, "index", None)
+    if idx is None:
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip(), gr.skip()
+
+    image_rgb = state["image"]
+    h, w = image_rgb.shape[:2]
+    cx = max(0, min(int(idx[0]), w - 1))
+    cy = max(0, min(int(idx[1]), h - 1))
+
+    ensure_medsam_image(image_rgb)
+
+    try:
+        cell_data = segment_whole_cell_at_point(medsam_predictor, image_rgb, cx, cy)
+    except Exception as e:
+        print("Error segmenting whole cell boundary:", e)
+        cell_data = None
+
+    if cell_data is None:
+        return gr.skip(), "Could not delineate whole-cell boundary at clicked location.", state, gr.skip(), gr.skip(), gr.skip()
+
+    instances = state.get("instances", [])
+    existing_idx = None
+    for i, inst in enumerate(instances):
+        if inst["whole_cell_mask"][cy, cx]:
+            existing_idx = i
+            break
+
+    if existing_idx is not None:
+        target_cell = instances[existing_idx]
+        selected_id = target_cell["id"]
+    else:
+        new_id = len(instances) + 1
+        cell_data["id"] = new_id
+        instances.append(cell_data)
+        target_cell = cell_data
+        selected_id = new_id
+
+    state["instances"] = instances
+    state["selected_id"] = selected_id
+
+    overlay = render_celldivision_display(image_rgb, instances, selected_id=selected_id)
+    report_md = format_celldivision_markdown(target_cell, total_cells=len(instances))
+
+    crop_rgb, cutout_rgba = extract_region(image_rgb, target_cell["whole_cell_mask"])
+
+    choices = [
+        f"Cell #{inst['id']} — {inst['division_stage']} ({inst['whole_area_um2']} µm²)"
+        for inst in instances
+    ]
+    current_choice = f"Cell #{target_cell['id']} — {target_cell['division_stage']} ({target_cell['whole_area_um2']} µm²)"
+
+    return overlay, report_md, state, crop_rgb, cutout_rgba, gr.update(choices=choices, value=current_choice)
+
+
+def scan_all_celldiv(image_rgb, state):
+    """Auto-scans candidate dividing cells across the field."""
+    if state is None or state.get("image") is None:
+        if image_rgb is None:
+            return gr.skip(), "Upload an image first.", state, gr.skip(), gr.skip(), gr.skip()
+        image_rgb = image_rgb.astype(np.uint8)
+        state = {"image": image_rgb}
+
+    image_rgb = state["image"]
+    ensure_medsam_image(image_rgb)
+
+    instances = scan_candidate_dividing_cells(medsam_predictor, image_rgb, max_candidates=12)
+    if not instances:
+        return image_rgb, "No distinct hyperchromatic dividing cells detected.", state, None, None, gr.update(choices=["No Cells Found"], value="No Cells Found")
+
+    state["instances"] = instances
+    selected_id = instances[0]["id"]
+    state["selected_id"] = selected_id
+
+    overlay = render_celldivision_display(image_rgb, instances, selected_id=selected_id)
+    report_md = format_celldivision_markdown(instances[0], total_cells=len(instances))
+
+    crop_rgb, cutout_rgba = extract_region(image_rgb, instances[0]["whole_cell_mask"])
+
+    choices = [
+        f"Cell #{inst['id']} — {inst['division_stage']} ({inst['whole_area_um2']} µm²)"
+        for inst in instances
+    ]
+    first_choice = choices[0]
+
+    return overlay, report_md, state, crop_rgb, cutout_rgba, gr.update(choices=choices, value=first_choice)
+
+
+def on_celldiv_dropdown_change(choice, state):
+    if state is None or state.get("image") is None or not state.get("instances"):
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip()
+
+    image_rgb = state["image"]
+    instances = state["instances"]
+
+    try:
+        cell_id = int(str(choice).split("#")[1].split(" ")[0])
+    except Exception:
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip()
+
+    target_cell = None
+    for inst in instances:
+        if inst["id"] == cell_id:
+            target_cell = inst
+            break
+
+    if target_cell is None:
+        return gr.skip(), gr.skip(), state, gr.skip(), gr.skip()
+
+    state["selected_id"] = cell_id
+    overlay = render_celldivision_display(image_rgb, instances, selected_id=cell_id)
+    report_md = format_celldivision_markdown(target_cell, total_cells=len(instances))
+    crop_rgb, cutout_rgba = extract_region(image_rgb, target_cell["whole_cell_mask"])
+
+    return overlay, report_md, state, crop_rgb, cutout_rgba
+
+
+def clear_celldiv_workspace():
+    return None, None, "Upload a slide image to begin.", None, None, None, gr.update(choices=["Click '+' on image to select a cell"], value="Click '+' on image to select a cell")
+
+
+# ─────────────────────────────────────────────────────────────
 # Web UI
 # ─────────────────────────────────────────────────────────────
 # [Oral Histopath AI - Commented out for now]
@@ -1395,7 +1558,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     )
 
     model_status = (
-        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `HoVer-Net (PanNuke/CoNSeP)`  \n"
+        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `HoVer-Net (PanNuke)` | `Cell Division & Whole-Cell Boundary (Mitosis / CellSAM)`  \n"
         f"Device: `{device}`  \n"
     )
     gr.Markdown(model_status)
@@ -1407,7 +1570,8 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                     "MedSAM",
                     "Herlev (EffNet-B7)",
                     # "Oral Histopath AI (ScribblePrompt & Morphometry)",  # [Commented out for now]
-                    "HoVer-Net PanNuke (Official Model)"
+                    "HoVer-Net PanNuke (Official Model)",
+                    "Cell Division & Whole-Cell Boundary (Mitosis / CellSAM)"
                 ],
                 value="MedSAM",
                 label="Segmentation Model",
@@ -1571,21 +1735,77 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
             """
         )
 
+    # 4. Cell Division & Whole-Cell Boundary Container (Mitosis / CellSAM)
+    celldiv_state = gr.State(None)
+    with gr.Column(visible=False) as celldiv_container:
+        gr.Markdown(
+            r"""
+            ### 🧬 Cell Division & Whole-Cell Boundary Segmentation (Mitosis / CellSAM)
+            *Whole-Cell Plasma Membrane & Mitotic Figure Identification (Israel et al. / Graham et al.)*  
+            - **Whole-Cell Boundary**: Segments the outer cellular membrane (plasma membrane + cytoplasm), **NOT** just the inner nucleus.
+            - **Cell Division / Mitosis Analysis**: Assesses chromatin hyper-condensation, mitotic equatorial plates, cytokinesis cleavage furrows, and Nuclear-to-Cytoplasmic (N:C) ratios.
+            - **How to use**: Click anywhere with **'+'** on any cell to segment its whole-cell boundary and analyze cell division!
+            """
+        )
+        with gr.Row():
+            celldiv_input_image = gr.Image(
+                label="1. Histology Slide (Click anywhere with '+' to select Cell Boundary)",
+                type="numpy",
+                image_mode="RGB",
+            )
+            celldiv_output_image = gr.Image(
+                label="2. Whole-Cell Boundary & Mitosis Result (Click '+' to add/inspect)",
+                type="numpy",
+                interactive=False,
+            )
+
+        with gr.Row():
+            celldiv_cell_dropdown = gr.Dropdown(
+                choices=["Click '+' on image to select a cell"],
+                value="Click '+' on image to select a cell",
+                label="🎯 Inspect Individual Cell Boundary (Select Cell #)",
+                interactive=True,
+                scale=2,
+            )
+            celldiv_scan_btn = gr.Button("⚡ Auto-Scan Dividing Cells (Mitosis Scan)", variant="primary", scale=1)
+            celldiv_clear_btn = gr.Button("Clear Workspace", scale=1)
+
+        celldiv_selected_info = gr.Markdown(
+            "Upload an image and click on any cell with **'+'** to segment its whole-cell boundary."
+        )
+
+        with gr.Accordion("🔬 Extracted Whole-Cell Entity (Dual RGB Crop & Transparent Plasma Cutout)", open=True):
+            with gr.Row():
+                celldiv_crop_display = gr.Image(label="Whole-Cell RGB Crop", type="numpy", interactive=False)
+                celldiv_cutout_display = gr.Image(label="Isolated Whole-Cell Cutout (Transparent)", type="numpy", interactive=False)
+
+        gr.Markdown(
+            """
+            ### 🎨 Compartment & Division Legend:
+            - 🟡 **Outer Amber Contour**: Whole-Cell Boundary (Plasma Membrane & Cytoplasmic Periphery)
+            - 🟣 **Inner Violet Contour**: Nuclear / Dividing Chromatin Core
+            - ⚡ **Active Mitosis**: Condensed equatorial plate or spindle figures (elevated N:C ratio)
+            - 🌱 **Cytokinesis**: Dividing cell with cleavage furrow indentation
+            """
+        )
+
     def switch_model_view(choice):
         is_medsam = ("MedSAM" in str(choice))
         is_herlev = ("Herlev" in str(choice))
         is_hover = ("HoVer-Net" in str(choice))
+        is_celldiv = ("Cell Division" in str(choice) or "CellSAM" in str(choice))
 
         return (
             gr.update(visible=is_medsam),
             gr.update(visible=is_herlev),
             gr.update(visible=is_hover),
+            gr.update(visible=is_celldiv),
         )
 
     model_choice.change(
         fn=switch_model_view,
         inputs=[model_choice],
-        outputs=[medsam_container, herlev_container, hovernet_container],
+        outputs=[medsam_container, herlev_container, hovernet_container, celldiv_container],
     )
 
     # MedSAM Events (Unchanged)
@@ -1711,6 +1931,46 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         outputs=[
             hover_input_image, hover_output_image, hover_selected_info, hover_state,
             hover_maps_display, hover_crop_display, hover_cutout_display, hover_cell_dropdown
+        ],
+    )
+
+    # Cell Division & Whole-Cell Boundary Events
+    celldiv_input_image.change(
+        fn=load_celldiv_image,
+        inputs=[celldiv_input_image],
+        outputs=[celldiv_output_image, celldiv_selected_info, celldiv_state, celldiv_crop_display, celldiv_cutout_display, celldiv_cell_dropdown],
+    )
+
+    celldiv_input_image.select(
+        fn=select_celldiv_point,
+        inputs=celldiv_state,
+        outputs=[celldiv_output_image, celldiv_selected_info, celldiv_state, celldiv_crop_display, celldiv_cutout_display, celldiv_cell_dropdown],
+    )
+
+    celldiv_output_image.select(
+        fn=select_celldiv_point,
+        inputs=celldiv_state,
+        outputs=[celldiv_output_image, celldiv_selected_info, celldiv_state, celldiv_crop_display, celldiv_cutout_display, celldiv_cell_dropdown],
+    )
+
+    celldiv_scan_btn.click(
+        fn=scan_all_celldiv,
+        inputs=[celldiv_input_image, celldiv_state],
+        outputs=[celldiv_output_image, celldiv_selected_info, celldiv_state, celldiv_crop_display, celldiv_cutout_display, celldiv_cell_dropdown],
+    )
+
+    celldiv_cell_dropdown.change(
+        fn=on_celldiv_dropdown_change,
+        inputs=[celldiv_cell_dropdown, celldiv_state],
+        outputs=[celldiv_output_image, celldiv_selected_info, celldiv_state, celldiv_crop_display, celldiv_cutout_display],
+    )
+
+    celldiv_clear_btn.click(
+        fn=clear_celldiv_workspace,
+        inputs=[],
+        outputs=[
+            celldiv_input_image, celldiv_output_image, celldiv_selected_info, celldiv_state,
+            celldiv_crop_display, celldiv_cutout_display, celldiv_cell_dropdown
         ],
     )
 
