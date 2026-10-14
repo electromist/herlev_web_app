@@ -1353,7 +1353,7 @@ def load_celldiv_image(image_rgb):
         image_rgb = image_rgb[:, :, :3]
     image_rgb = image_rgb.astype(np.uint8)
 
-    ensure_medsam_image(image_rgb)
+    prewarm_medsam_image(image_rgb)
 
     state = {
         "image": image_rgb,
@@ -1369,14 +1369,25 @@ def load_celldiv_image(image_rgb):
     return image_rgb, info, state, None, None, gr.update(choices=["Click '+' on image to select a cell"], value="Click '+' on image to select a cell")
 
 
-def select_celldiv_point(state, evt: gr.SelectData):
+def select_celldiv_point(input_img, state, evt: gr.SelectData):
     """
     Callback when user clicks '+' on any cell.
     Segments the WHOLE CELL BOUNDARY (membrane + cytoplasm), not just the nucleus,
     and analyzes cell division / mitosis.
     """
-    if state is None or state.get("image") is None:
-        return gr.skip(), "Upload a slide image first.", state, gr.skip(), gr.skip(), gr.skip()
+    if state is None or not isinstance(state, dict):
+        state = {"image": None, "instances": [], "selected_id": None}
+    if state.get("image") is None:
+        if input_img is None:
+            return gr.skip(), "Upload a slide image first.", state, gr.skip(), gr.skip(), gr.skip()
+        if input_img.ndim == 2:
+            input_img = cv2.cvtColor(input_img, cv2.COLOR_GRAY2RGB)
+        if input_img.shape[-1] == 4:
+            input_img = input_img[:, :, :3]
+        state["image"] = input_img.astype(np.uint8)
+        state["instances"] = []
+        state["selected_id"] = None
+
     idx = getattr(evt, "index", None)
     if idx is None:
         return gr.skip(), gr.skip(), state, gr.skip(), gr.skip(), gr.skip()
@@ -1433,11 +1444,18 @@ def select_celldiv_point(state, evt: gr.SelectData):
 
 def scan_all_celldiv(image_rgb, state):
     """Auto-scans candidate dividing cells across the field."""
-    if state is None or state.get("image") is None:
+    if state is None or not isinstance(state, dict):
+        state = {"image": None, "instances": [], "selected_id": None}
+    if state.get("image") is None:
         if image_rgb is None:
             return gr.skip(), "Upload an image first.", state, gr.skip(), gr.skip(), gr.skip()
-        image_rgb = image_rgb.astype(np.uint8)
-        state = {"image": image_rgb}
+        if image_rgb.ndim == 2:
+            image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+        if image_rgb.shape[-1] == 4:
+            image_rgb = image_rgb[:, :, :3]
+        state["image"] = image_rgb.astype(np.uint8)
+        state["instances"] = []
+        state["selected_id"] = None
 
     image_rgb = state["image"]
     ensure_medsam_image(image_rgb)
@@ -1945,13 +1963,13 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
 
     celldiv_input_image.select(
         fn=select_celldiv_point,
-        inputs=celldiv_state,
+        inputs=[celldiv_input_image, celldiv_state],
         outputs=[celldiv_output_image, celldiv_selected_info, celldiv_state, celldiv_crop_display, celldiv_cutout_display, celldiv_cell_dropdown],
     )
 
     celldiv_output_image.select(
         fn=select_celldiv_point,
-        inputs=celldiv_state,
+        inputs=[celldiv_input_image, celldiv_state],
         outputs=[celldiv_output_image, celldiv_selected_info, celldiv_state, celldiv_crop_display, celldiv_cutout_display, celldiv_cell_dropdown],
     )
 
