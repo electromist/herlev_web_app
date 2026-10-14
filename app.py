@@ -36,7 +36,7 @@ from hovernet import (
     HOVERNET_CLASSES
 )
 
-from celldivision import (
+from csgo_celldivision import (
     segment_whole_cell_at_point,
     scan_candidate_dividing_cells,
     render_celldivision_display,
@@ -1342,7 +1342,7 @@ def clear_hovernet_workspace():
 
 
 # ─────────────────────────────────────────────────────────────
-# Cell Division & Whole-Cell Boundary Handlers (Mitosis / CellSAM)
+# Cell Division & Whole-Cell Boundary Handlers (CSGO & Mitosis AI)
 # ─────────────────────────────────────────────────────────────
 def load_celldiv_image(image_rgb):
     if image_rgb is None:
@@ -1361,10 +1361,10 @@ def load_celldiv_image(image_rgb):
         "selected_id": None
     }
     info = (
-        "### Histology Image Loaded — Whole-Cell Boundary Mode\n\n"
-        "- Click **any cell with '+'** on the image below to segment its **Whole-Cell Boundary (Plasma Membrane & Cytoplasm)**.\n"
+        "### Histology Slide Loaded — Whole-Cell & Mitosis Mode\n\n"
+        "- Click **any cell with '+'** on the image below to segment its **Whole-Cell Boundary (Plasma Membrane + Cytoplasm)** using CSGO & MedSAM.\n"
         "- The system will simultaneously analyze **Cell Division & Mitosis** (Metaphase/Anaphase plates, Cytokinesis cleavage furrows, and Nuclear-to-Cytoplasmic N:C ratio).\n"
-        "- Or, click **'⚡ Auto-Scan Dividing Cells'** to locate candidate mitotic figures across the slide."
+        "- Or, click **'⚡ Auto-Scan Mitotic / Dividing Cells'** to locate candidate mitotic figures across the slide."
     )
     return image_rgb, info, state, None, None, gr.update(choices=["Click '+' on image to select a cell"], value="Click '+' on image to select a cell")
 
@@ -1558,7 +1558,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     )
 
     model_status = (
-        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `HoVer-Net (PanNuke)` | `Cell Division & Whole-Cell Boundary (Mitosis / CellSAM)`  \n"
+        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `HoVer-Net (PanNuke)` | `Cell Division & Whole-Cell (CSGO & Mitosis AI)`  \n"
         f"Device: `{device}`  \n"
     )
     gr.Markdown(model_status)
@@ -1571,7 +1571,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                     "Herlev (EffNet-B7)",
                     # "Oral Histopath AI (ScribblePrompt & Morphometry)",  # [Commented out for now]
                     "HoVer-Net PanNuke (Official Model)",
-                    "Cell Division & Whole-Cell Boundary (Mitosis / CellSAM)"
+                    "Cell Division & Whole-Cell Boundary (CSGO & Mitosis AI)"
                 ],
                 value="MedSAM",
                 label="Segmentation Model",
@@ -1735,14 +1735,14 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
             """
         )
 
-    # 4. Cell Division & Whole-Cell Boundary Container (Mitosis / CellSAM)
+    # 4. Cell Division & Whole-Cell Boundary Container (CSGO & Mitosis AI)
     celldiv_state = gr.State(None)
     with gr.Column(visible=False) as celldiv_container:
         gr.Markdown(
             r"""
-            ### 🧬 Cell Division & Whole-Cell Boundary Segmentation (Mitosis / CellSAM)
-            *Whole-Cell Plasma Membrane & Mitotic Figure Identification (Israel et al. / Graham et al.)*  
-            - **Whole-Cell Boundary**: Segments the outer cellular membrane (plasma membrane + cytoplasm), **NOT** just the inner nucleus.
+            ### 🧬 Cell Division & Whole-Cell Boundary Segmentation (CSGO & Mitosis AI)
+            *Whole-Cell Plasma Membrane & Mitotic Figure Identification (Gu et al., Lab Invest 2025 / OMG-Net criteria)*  
+            - **Whole-Cell Boundary**: Segments the outer cellular boundary (plasma membrane + cytoplasm), **NOT** just the inner nucleus.
             - **Cell Division / Mitosis Analysis**: Assesses chromatin hyper-condensation, mitotic equatorial plates, cytokinesis cleavage furrows, and Nuclear-to-Cytoplasmic (N:C) ratios.
             - **How to use**: Click anywhere with **'+'** on any cell to segment its whole-cell boundary and analyze cell division!
             """
@@ -1767,7 +1767,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                 interactive=True,
                 scale=2,
             )
-            celldiv_scan_btn = gr.Button("⚡ Auto-Scan Dividing Cells (Mitosis Scan)", variant="primary", scale=1)
+            celldiv_scan_btn = gr.Button("⚡ Auto-Scan Mitotic / Dividing Cells", variant="primary", scale=1)
             celldiv_clear_btn = gr.Button("Clear Workspace", scale=1)
 
         celldiv_selected_info = gr.Markdown(
@@ -1782,10 +1782,12 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         gr.Markdown(
             """
             ### 🎨 Compartment & Division Legend:
-            - 🟡 **Outer Amber Contour**: Whole-Cell Boundary (Plasma Membrane & Cytoplasmic Periphery)
+            - 🟡 **Outer Amber Contour**: Whole-Cell Boundary (Plasma Membrane & Cytoplasmic Periphery via CSGO & MedSAM)
             - 🟣 **Inner Violet Contour**: Nuclear / Dividing Chromatin Core
-            - ⚡ **Active Mitosis**: Condensed equatorial plate or spindle figures (elevated N:C ratio)
-            - 🌱 **Cytokinesis**: Dividing cell with cleavage furrow indentation
+            - 🔴 **Active Mitosis: Metaphase**: Dense equatorial plate (elevated N:C ratio)
+            - 🟠 **Active Mitosis: Anaphase**: Polar chromosome separation
+            - 🟣 **Active Mitosis: Cytokinesis**: Dividing cell with cleavage furrow indentation
+            - 🟢 **Interphase**: Quiescent cell with intact nuclear-cytoplasmic boundary
             """
         )
 
@@ -1793,7 +1795,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
         is_medsam = ("MedSAM" in str(choice))
         is_herlev = ("Herlev" in str(choice))
         is_hover = ("HoVer-Net" in str(choice))
-        is_celldiv = ("Cell Division" in str(choice) or "CellSAM" in str(choice))
+        is_celldiv = ("Cell Division" in str(choice))
 
         return (
             gr.update(visible=is_medsam),
