@@ -9,6 +9,11 @@
 herlev_effnetb7_fpn.pth
 medsam_vit_b.pth
 
+# Allow cell division and mitosis models tracked via Git LFS
+!midog_dann_mitosis.pth
+!csgo_membrane_unet.pt
+!diamandis_mitosis_retinanet.pth
+
 # Python / Environment
 __pycache__/
 *.py[cod]
