@@ -506,49 +506,36 @@ def segment_whole_cell_at_point(medsam_predictor, image_rgb: np.ndarray, cx: int
     cv2.drawContours(whole_mask.view(np.uint8), [whole_c], -1, 1, -1)
 
     # Step 4: True Whole-Cell Boundary & Internal Dividing Chromatin Core
-    # In H&E tissue, detectors isolate the inner dark purple nucleus (area < 1200 px).
-    # If initial mask is only the inner nucleus, preserve it as nuclear_mask and
-    # expand outward through the cytoplasm to encompass the complete outer plasma boundary.
-    if whole_clean.sum() < 1200:
-        nuclear_mask = whole_mask.copy()
-        nuc_c = whole_c
+    # In H&E tissue, detectors isolate the dense inner chromatin core / nucleus.
+    # The true cellular plasma membrane encompasses the surrounding eosinophilic cytoplasm.
+    nuclear_mask = whole_mask.copy()
+    nuc_c = whole_c
+    nuc_area = max(16.0, float(cv2.contourArea(nuc_c)))
+    rn = math.sqrt(nuc_area / math.pi)
 
-        dist_from_nuc = ndi.distance_transform_edt(~nuclear_mask)
-        # Cytoplasmic boundary extends ~16px beyond nucleus perimeter (total cell radius ~25-28px)
-        whole_raw = (dist_from_nuc <= 16).astype(np.uint8)
-        k_whole = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        whole_clean = cv2.morphologyEx(whole_raw, cv2.MORPH_CLOSE, k_whole)
-        w_cnts, _ = cv2.findContours(whole_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if w_cnts:
-            whole_c = max(w_cnts, key=cv2.contourArea)
-            whole_mask = np.zeros((h, w), dtype=bool)
-            cv2.drawContours(whole_mask.view(np.uint8), [whole_c], -1, 1, -1)
+    # Biological Whole-Cell Expansion:
+    # Plasma membrane extends outward from the nuclear perimeter by ~1.35x to 1.5x nuclear radius,
+    # giving an overall whole-cell diameter of ~2.35x to 2.5x the nucleus.
+    exp_dist = int(max(20, rn * 1.35))
+    dist_from_nuc = ndi.distance_transform_edt(~nuclear_mask)
+    whole_raw = (dist_from_nuc <= exp_dist)
+
+    # Constrain to tissue body (stop at empty slide glass / white background)
+    is_tissue = (image_rgb.mean(axis=-1) < 238)
+    whole_raw = (whole_raw & is_tissue).astype(np.uint8)
+
+    k_whole = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(5, int(rn * 0.25)), max(5, int(rn * 0.25))))
+    whole_clean = cv2.morphologyEx(whole_raw, cv2.MORPH_CLOSE, k_whole)
+    whole_clean = ndi.binary_fill_holes(whole_clean).astype(np.uint8)
+
+    w_cnts, _ = cv2.findContours(whole_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if w_cnts:
+        whole_c = max(w_cnts, key=cv2.contourArea)
+        whole_mask = np.zeros((h, w), dtype=bool)
+        cv2.drawContours(whole_mask.view(np.uint8), [whole_c], -1, 1, -1)
     else:
-        # Initial mask already covers the whole cell, isolate internal chromatin core
-        green = image_rgb[:, :, 1].astype(np.float32)
-        darkness = 255.0 - green
-        darkness[~whole_mask] = 0
-
-        dist_from_membrane = ndi.distance_transform_edt(whole_mask)
-        inner_zone = dist_from_membrane > 5
-        if not inner_zone.any():
-            inner_zone = whole_mask
-
-        thresh_val = np.percentile(darkness[whole_mask & inner_zone], 50)
-        nuclear_raw = ((darkness > thresh_val) & inner_zone).astype(np.uint8)
-        k_nuc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        nuclear_clean = cv2.morphologyEx(nuclear_raw, cv2.MORPH_OPEN, k_nuc)
-        nuclear_clean = cv2.morphologyEx(nuclear_clean, cv2.MORPH_CLOSE, k_nuc)
-        nuclear_clean = ndi.binary_fill_holes(nuclear_clean).astype(np.uint8)
-
-        n_cnts, _ = cv2.findContours(nuclear_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if n_cnts:
-            nuc_c = max(n_cnts, key=cv2.contourArea)
-            nuclear_mask = np.zeros((h, w), dtype=bool)
-            cv2.drawContours(nuclear_mask.view(np.uint8), [nuc_c], -1, 1, -1)
-        else:
-            nuclear_mask = whole_mask.copy()
-            nuc_c = whole_c
+        whole_mask = nuclear_mask.copy()
+        whole_c = nuc_c
 
     # Step 5: Mitosis & Morphometry Analysis
     cell_info = analyze_cell_division(image_rgb, whole_mask, nuclear_mask, whole_c, nuc_c, (cx, cy))
@@ -607,7 +594,10 @@ def analyze_cell_division(image_rgb: np.ndarray, whole_mask: np.ndarray, nuclear
     is_cleavage_furrow = (solidity < 0.88 and aspect_ratio >= 1.45)
 
     # Deep Learning Mitosis Detection (MIDOG++ Multi-Scale DANN Model)
-    is_mitotic, p_mitotic = predict_mitosis_probability(image_rgb, center[0], center[1], radius=36)
+    # Adapt evaluation radius to cell dimensions (ensures context capture across all resolutions)
+    bx, by, bw, bh = cv2.boundingRect(whole_c)
+    eval_radius = max(64, int(max(bw, bh) * 0.72))
+    is_mitotic, p_mitotic = predict_mitosis_probability(image_rgb, center[0], center[1], radius=eval_radius)
 
     # Mitotic Stage Classification Grounded in Deep Learning Output
     if is_mitotic:
@@ -677,53 +667,44 @@ def analyze_cell_division(image_rgb: np.ndarray, whole_mask: np.ndarray, nuclear
 # ─────────────────────────────────────────────────────────────
 def scan_candidate_dividing_cells(medsam_predictor, image_rgb: np.ndarray, max_candidates: int = 15) -> list:
     """
-    Scans the entire slide image for candidate whole cells using Cellpose Cyto3,
-    and analyzes cell division and mitosis for each instance.
+    Scans the slide image for candidate whole cells and dividing mitotic figures.
+    Optimized for fast CPU response (<2 seconds) by ranking candidate chromatin peaks
+    and evaluating the top candidate figures.
     """
     h, w = image_rgb.shape[:2]
-    masks = get_cached_cellpose_masks(image_rgb, diameter=None)
     cells = []
 
-    if masks is not None:
-        unique_vals = np.unique(masks)
-        for val in unique_vals:
-            if val == 0:
-                continue
-            m = (masks == val)
-            if m.sum() < 80:
-                continue
-            ys, xs = np.where(m)
-            cx, cy = int(xs.mean()), int(ys.mean())
+    # Detect candidate cell nuclei centers using chromatin darkness
+    green = image_rgb[:, :, 1].astype(np.float32)
+    darkness = 255.0 - green
+    blurred = cv2.GaussianBlur(darkness, (7, 7), 0)
+    thresh = np.percentile(blurred, 88)
+    candidates_mask = (blurred > thresh).astype(np.uint8)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(candidates_mask)
+    ranked = []
+    for lbl in range(1, num_labels):
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if 40 <= area <= 4000:
+            cx, cy = int(centroids[lbl][0]), int(centroids[lbl][1])
+            ranked.append((blurred[cy, cx], cx, cy))
+    ranked.sort(key=lambda x: x[0], reverse=True)
 
-            cell_data = segment_whole_cell_at_point(medsam_predictor, image_rgb, cx, cy)
-            if cell_data is not None:
-                cells.append(cell_data)
+    selected_points = []
+    min_dist_sq = 45 ** 2
+    for _, cx, cy in ranked:
+        if any((cx - px)**2 + (cy - py)**2 < min_dist_sq for px, py in selected_points):
+            continue
+        selected_points.append((cx, cy))
+        if len(selected_points) >= max_candidates:
+            break
 
-    # If Cellpose found no cells, fall back to chromatin peaks
-    if not cells:
-        green = image_rgb[:, :, 1].astype(np.float32)
-        darkness = 255.0 - green
-        blurred = cv2.GaussianBlur(darkness, (7, 7), 0)
-        thresh = np.percentile(blurred, 92)
-        candidates_mask = (blurred > thresh).astype(np.uint8)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(candidates_mask)
-        ranked = []
-        for lbl in range(1, num_labels):
-            area = stats[lbl, cv2.CC_STAT_AREA]
-            if 30 <= area <= 2500:
-                cx, cy = int(centroids[lbl][0]), int(centroids[lbl][1])
-                ranked.append((blurred[cy, cx], cx, cy))
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        for _, cx, cy in ranked[:max_candidates]:
-            if any((cx - c["center"][0])**2 + (cy - c["center"][1])**2 < (28**2) for c in cells):
-                continue
-            cell_data = segment_whole_cell_at_point(medsam_predictor, image_rgb, cx, cy)
-            if cell_data is not None:
-                cells.append(cell_data)
+    for cx, cy in selected_points:
+        cell_data = segment_whole_cell_at_point(medsam_predictor, image_rgb, cx, cy)
+        if cell_data is not None:
+            cells.append(cell_data)
 
     # Sort descending by mitotic probability so active cell divisions appear first!
     cells.sort(key=lambda c: c.get("mitosis_probability", 0.0), reverse=True)
-    cells = cells[:max_candidates]
     for i, c in enumerate(cells):
         c["id"] = i + 1
 
