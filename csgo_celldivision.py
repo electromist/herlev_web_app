@@ -170,8 +170,58 @@ def get_csgo_model():
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. Whole-Cell Boundary Delineation (Plasma Membrane + Cytoplasm)
+# 3. Cellpose Cyto3 Whole-Cell Engine & Model Loader Singleton
 # ─────────────────────────────────────────────────────────────
+_CELLPOSE_MODEL = None
+_CELLPOSE_CACHE = {}
+
+def get_cellpose_model():
+    """Returns loaded Cellpose Cyto3 Whole-Cell model (CPU optimized)."""
+    global _CELLPOSE_MODEL
+    if _CELLPOSE_MODEL is not None:
+        return _CELLPOSE_MODEL
+
+    try:
+        import warnings
+        warnings.filterwarnings("ignore", category=UserWarning, module="cellpose")
+        from cellpose import models
+        _CELLPOSE_MODEL = models.CellposeModel(gpu=False, model_type="cyto3")
+        print("[Cellpose] Loaded official Cyto3 Whole-Cell model on CPU.")
+    except Exception as e:
+        print("[Cellpose] Cyto3 initialization error:", e)
+        _CELLPOSE_MODEL = None
+
+    return _CELLPOSE_MODEL
+
+
+def get_cached_cellpose_masks(image_rgb: np.ndarray, diameter: int = 100) -> np.ndarray:
+    """
+    Caches Cellpose whole-cell evaluation for the current image so multiple
+    cell selections or inspections are instantaneous.
+    """
+    h, w = image_rgb.shape[:2]
+    sig = (h, w, int(image_rgb[0, 0, 0]), int(image_rgb[h // 2, w // 2, 0]), int(image_rgb[-1, -1, 0]), diameter)
+    if sig in _CELLPOSE_CACHE:
+        return _CELLPOSE_CACHE[sig]
+
+    cp = get_cellpose_model()
+    if cp is None:
+        return None
+
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            masks, _, _ = cp.eval(image_rgb, diameter=diameter, channels=[0, 0])
+        if len(_CELLPOSE_CACHE) > 4:
+            _CELLPOSE_CACHE.clear()
+        _CELLPOSE_CACHE[sig] = masks
+        return masks
+    except Exception as e:
+        print("[Cellpose] Inference warning:", e)
+        return None
+
+
 def predict_csgo_membrane_patch(image_rgb: np.ndarray, box: tuple = None) -> np.ndarray:
     """
     Predicts cell membrane probability map across image patch using CSGO U-Net.
@@ -190,7 +240,6 @@ def predict_csgo_membrane_patch(image_rgb: np.ndarray, box: tuple = None) -> np.
         x1, y1, x2, y2 = 0, 0, w, h
         sub_img = image_rgb
 
-    # Make dimensions divisible by 16 for UNet
     sh, sw = sub_img.shape[:2]
     target_h = int(math.ceil(sh / 16.0) * 16)
     target_w = int(math.ceil(sw / 16.0) * 16)
@@ -212,93 +261,140 @@ def predict_csgo_membrane_patch(image_rgb: np.ndarray, box: tuple = None) -> np.
 
 def segment_whole_cell_at_point(medsam_predictor, image_rgb: np.ndarray, cx: int, cy: int) -> dict:
     """
-    Segments the WHOLE CELL BOUNDARY (Plasma Membrane & Cytoplasm) at clicked point (cx, cy).
-    Combines:
-    1. MedSAM Multi-Mask Hierarchy: evaluates Level 2 (Whole Object / Outer Cell Body).
-    2. CSGO Pretrained Membrane U-Net: snaps boundary to true H&E cellular membranes.
-    3. Hematoxylin/Eosin Chromatin Decomposition: isolates internal nuclear dividing plate.
+    Segments the entire WHOLE CELL BODY (Plasma Membrane + Cytoplasm + Nucleus) at clicked point (cx, cy).
+    Workflow:
+    1. Primary Engine: Cellpose Cyto3 (Whole-cell & cytoplasmic boundaries foundation model).
+    2. Snap-to-cell tolerance: Snaps accurately if click falls near outer membrane perimeter.
+    3. Resilient Fallbacks: MedSAM whole-cell box prompting & CSGO membrane U-Net.
+    4. Hematoxylin/Eosin Chromatin Decomposition: Isolates internal nuclear/mitotic dividing core.
     """
     h, w = image_rgb.shape[:2]
     cx = max(0, min(cx, w - 1))
     cy = max(0, min(cy, h - 1))
 
-    # Step A: Local patch coordinates for precision
-    patch_radius = 64
-    x1, y1 = max(0, cx - patch_radius), max(0, cy - patch_radius)
-    x2, y2 = min(w, cx + patch_radius), min(h, cy + patch_radius)
+    whole_mask = None
 
-    # Step B: Run CSGO Membrane Prediction on local neighborhood
-    csgo_membrane = predict_csgo_membrane_patch(image_rgb, box=(x1, y1, x2, y2))
-
-    # Step C: MedSAM Whole-Cell Prompting
-    whole_cell_mask = np.zeros((h, w), dtype=bool)
-    if medsam_predictor is not None:
+    # Step 1: Cellpose Cyto3 Whole-Cell Segmentation
+    cp_model = get_cellpose_model()
+    if cp_model is not None:
         try:
-            # Prompt MedSAM with box enclosing the expected cell radius + center point
-            box_prompt = np.array([x1, y1, x2, y2])
-            pts = np.array([[cx, cy]], dtype=np.float32)
-            lbls = np.array([1], dtype=np.int32)
+            if max(h, w) <= 450:
+                masks = get_cached_cellpose_masks(image_rgb, diameter=100)
+                if masks is not None:
+                    val = masks[cy, cx]
+                    if val == 0:
+                        # Snap to nearest cell if click was within 25px neighborhood
+                        rad = 25
+                        nx1, ny1 = max(0, cx - rad), max(0, cy - rad)
+                        nx2, ny2 = min(w, cx + rad), min(h, cy + rad)
+                        sub_m = masks[ny1:ny2, nx1:nx2]
+                        nonzero = sub_m[sub_m > 0]
+                        if len(nonzero) > 0:
+                            val = int(np.bincount(nonzero).argmax())
+                    if val > 0:
+                        whole_mask = (masks == val)
+            else:
+                # Patch evaluation around clicked point for sub-second CPU response
+                patch_r = 140
+                x1, y1 = max(0, cx - patch_r), max(0, cy - patch_r)
+                x2, y2 = min(w, cx + patch_r), min(h, cy + patch_r)
+                sub_img = image_rgb[y1:y2, x1:x2]
+                sub_cx, sub_cy = cx - x1, cy - y1
 
-            masks, iou_preds, _ = medsam_predictor.predict(
-                point_coords=pts,
-                point_labels=lbls,
-                box=box_prompt[None, :],
-                multimask_output=True
-            )
-            # Pick the outer whole-cell mask (largest plausible cell boundary containing clicked point)
-            best_mask = None
-            max_area = 0
-            for m, iou in zip(masks, iou_preds):
-                if m[cy, cx]:
-                    a = int(m.sum())
-                    if a > max_area and a < (h * w * 0.25):
-                        max_area = a
-                        best_mask = m
-            if best_mask is not None:
-                whole_cell_mask = best_mask.copy()
+                sub_masks = get_cached_cellpose_masks(sub_img, diameter=100)
+                if sub_masks is not None:
+                    val = sub_masks[sub_cy, sub_cx]
+                    if val == 0:
+                        rad = 25
+                        nx1, ny1 = max(0, sub_cx - rad), max(0, sub_cy - rad)
+                        nx2, ny2 = min(sub_img.shape[1], sub_cx + rad), min(sub_img.shape[0], sub_cy + rad)
+                        sub_m = sub_masks[ny1:ny2, nx1:nx2]
+                        nonzero = sub_m[sub_m > 0]
+                        if len(nonzero) > 0:
+                            val = int(np.bincount(nonzero).argmax())
+                    if val > 0:
+                        whole_mask = np.zeros((h, w), dtype=bool)
+                        whole_mask[y1:y2, x1:x2] = (sub_masks == val)
         except Exception as e:
-            print("MedSAM whole cell predict warning:", e)
+            print("[Cellpose] Segment at point error:", e)
 
-    # Fallback / Boundary Refinement with CSGO Membrane Field
-    if not whole_cell_mask.any() or whole_cell_mask.sum() < 40:
-        # Distance transform flood constrained by CSGO membrane barriers
-        local_membrane = csgo_membrane[y1:y2, x1:x2]
-        membrane_barrier = (local_membrane > 0.40).astype(np.uint8)
+    # Step 2: Fallback to MedSAM Whole-Cell Box Prompt if Cellpose did not find a mask
+    if whole_mask is None or not whole_mask.any() or whole_mask.sum() < 60:
+        if medsam_predictor is not None:
+            try:
+                patch_radius = 80
+                x1, y1 = max(0, cx - patch_radius), max(0, cy - patch_radius)
+                x2, y2 = min(w, cx + patch_radius), min(h, cy + patch_radius)
+                box_prompt = np.array([x1, y1, x2, y2])
+                pts = np.array([[cx, cy]], dtype=np.float32)
+                lbls = np.array([1], dtype=np.int32)
 
-        local_seed = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
-        local_seed[cy - y1, cx - x1] = 1
+                masks_sam, iou_preds, _ = medsam_predictor.predict(
+                    point_coords=pts,
+                    point_labels=lbls,
+                    box=box_prompt[None, :],
+                    multimask_output=True
+                )
+                best_m = None
+                max_a = 0
+                for m in masks_sam:
+                    if m[cy, cx]:
+                        a = int(m.sum())
+                        if a > max_a:
+                            max_a = a
+                            best_m = m
+                if best_m is not None:
+                    whole_mask = best_m.copy()
+            except Exception as e:
+                print("[MedSAM] Fallback error:", e)
 
-        dist = cv2.distanceTransform(1 - membrane_barrier, cv2.DIST_L2, 5)
-        _, cell_flood = cv2.threshold(dist, 0.1, 255, cv2.THRESH_BINARY)
-        num_l, labels = cv2.connectedComponents(cell_flood.astype(np.uint8))
-        target_lbl = labels[cy - y1, cx - x1]
-        if target_lbl > 0:
-            whole_cell_mask[y1:y2, x1:x2] = (labels == target_lbl)
-        else:
-            # Fallback circle around cell
-            cv2.circle(whole_cell_mask.view(np.uint8), (cx, cy), 18, 1, -1)
+    # Step 3: CSGO Membrane distance flood fallback
+    if whole_mask is None or not whole_mask.any() or whole_mask.sum() < 60:
+        try:
+            csgo_membrane = predict_csgo_membrane_patch(image_rgb)
+            membrane_barrier = (csgo_membrane > 0.35).astype(np.uint8)
+            dist = cv2.distanceTransform(1 - membrane_barrier, cv2.DIST_L2, 5)
+            _, cell_flood = cv2.threshold(dist, 0.1, 255, cv2.THRESH_BINARY)
+            num_l, labels = cv2.connectedComponents(cell_flood.astype(np.uint8))
+            target_lbl = labels[cy, cx]
+            whole_mask = np.zeros((h, w), dtype=bool)
+            if target_lbl > 0:
+                whole_mask = (labels == target_lbl)
+            else:
+                cv2.circle(whole_mask.view(np.uint8), (cx, cy), 28, 1, -1)
+        except Exception as e:
+            print("[CSGO] Flood fallback error:", e)
+            whole_mask = np.zeros((h, w), dtype=bool)
+            cv2.circle(whole_mask.view(np.uint8), (cx, cy), 28, 1, -1)
 
     # Clean morphology of whole-cell boundary
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    whole_cell_clean = cv2.morphologyEx(whole_cell_mask.astype(np.uint8), cv2.MORPH_CLOSE, k)
-    whole_cell_clean = ndi.binary_fill_holes(whole_cell_clean).astype(np.uint8)
+    whole_clean = cv2.morphologyEx(whole_mask.astype(np.uint8), cv2.MORPH_CLOSE, k)
+    whole_clean = ndi.binary_fill_holes(whole_clean).astype(np.uint8)
 
-    cnts, _ = cv2.findContours(whole_cell_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(whole_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
     whole_c = max(cnts, key=cv2.contourArea)
     whole_mask = np.zeros((h, w), dtype=bool)
     cv2.drawContours(whole_mask.view(np.uint8), [whole_c], -1, 1, -1)
 
-    # Step D: Isolate Internal Nuclear / Dividing Chromatin Core
-    # Optical density in green channel (Hematoxylin absorbs green light intensely)
+    # Step 4: Isolate Internal Nuclear / Dividing Chromatin Core
     green = image_rgb[:, :, 1].astype(np.float32)
     darkness = 255.0 - green
     darkness[~whole_mask] = 0
 
-    thresh_val = np.percentile(darkness[whole_mask], 60) if whole_mask.any() else 50
-    nuclear_raw = (darkness > thresh_val).astype(np.uint8)
-    nuclear_clean = cv2.morphologyEx(nuclear_raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    dist_from_membrane = ndi.distance_transform_edt(whole_mask)
+    inner_zone = dist_from_membrane > 5
+    if not inner_zone.any():
+        inner_zone = whole_mask
+
+    thresh_val = np.percentile(darkness[whole_mask & inner_zone], 50)
+    nuclear_raw = ((darkness > thresh_val) & inner_zone).astype(np.uint8)
+    k_nuc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    nuclear_clean = cv2.morphologyEx(nuclear_raw, cv2.MORPH_OPEN, k_nuc)
+    nuclear_clean = cv2.morphologyEx(nuclear_clean, cv2.MORPH_CLOSE, k_nuc)
+    nuclear_clean = ndi.binary_fill_holes(nuclear_clean).astype(np.uint8)
 
     n_cnts, _ = cv2.findContours(nuclear_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if n_cnts:
@@ -309,7 +405,7 @@ def segment_whole_cell_at_point(medsam_predictor, image_rgb: np.ndarray, cx: int
         nuclear_mask = whole_mask.copy()
         nuc_c = whole_c
 
-    # Step E: Analyze Cell Division & Mitosis
+    # Step 5: Mitosis & Morphometry Analysis
     cell_info = analyze_cell_division(image_rgb, whole_mask, nuclear_mask, whole_c, nuc_c, (cx, cy))
     cell_info["whole_cell_mask"] = whole_mask
     cell_info["nuclear_mask"] = nuclear_mask
@@ -421,46 +517,57 @@ def analyze_cell_division(image_rgb: np.ndarray, whole_mask: np.ndarray, nuclear
 
 
 # ─────────────────────────────────────────────────────────────
-# 5. Auto-Scan Mitotic & Dividing Cells
+# 5. Auto-Scan Mitotic & Dividing Cells (Cellpose Whole-Cell Scanner)
 # ─────────────────────────────────────────────────────────────
-def scan_candidate_dividing_cells(medsam_predictor, image_rgb: np.ndarray, max_candidates: int = 12) -> list:
+def scan_candidate_dividing_cells(medsam_predictor, image_rgb: np.ndarray, max_candidates: int = 15) -> list:
     """
-    Scans the histology field for candidate mitotic / dividing cells based on:
-    1. Chromatin hyperchromatism peaks.
-    2. CSGO membrane boundaries.
+    Scans the entire slide image for candidate whole cells using Cellpose Cyto3,
+    and analyzes cell division and mitosis for each instance.
     """
     h, w = image_rgb.shape[:2]
-    green = image_rgb[:, :, 1].astype(np.float32)
-    darkness = 255.0 - green
-
-    # Blur slightly to eliminate noise pixels
-    blurred = cv2.GaussianBlur(darkness, (7, 7), 0)
-    thresh = np.percentile(blurred, 93)  # top 7% intense chromatin
-    candidates_mask = (blurred > thresh).astype(np.uint8)
-
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(candidates_mask)
-
+    masks = get_cached_cellpose_masks(image_rgb, diameter=100)
     cells = []
-    # Sort centroids by chromatin peak intensity
-    ranked_indices = []
-    for lbl in range(1, num_labels):
-        area = stats[lbl, cv2.CC_STAT_AREA]
-        if 20 <= area <= 1600:
-            cx, cy = int(centroids[lbl][0]), int(centroids[lbl][1])
-            peak_val = blurred[cy, cx]
-            ranked_indices.append((peak_val, cx, cy))
 
-    ranked_indices.sort(key=lambda x: x[0], reverse=True)
+    if masks is not None:
+        unique_vals = np.unique(masks)
+        for val in unique_vals:
+            if val == 0:
+                continue
+            m = (masks == val)
+            if m.sum() < 120:
+                continue
+            ys, xs = np.where(m)
+            cx, cy = int(xs.mean()), int(ys.mean())
 
-    for idx, (_, cx, cy) in enumerate(ranked_indices[:max_candidates]):
-        # Check distance from existing found cells
-        if any((cx - c["center"][0])**2 + (cy - c["center"][1])**2 < (24**2) for c in cells):
-            continue
+            cell_data = segment_whole_cell_at_point(medsam_predictor, image_rgb, cx, cy)
+            if cell_data is not None:
+                cell_data["id"] = len(cells) + 1
+                cells.append(cell_data)
+                if len(cells) >= max_candidates:
+                    break
 
-        cell_data = segment_whole_cell_at_point(medsam_predictor, image_rgb, cx, cy)
-        if cell_data is not None:
-            cell_data["id"] = len(cells) + 1
-            cells.append(cell_data)
+    # If Cellpose found no cells, fall back to chromatin peaks
+    if not cells:
+        green = image_rgb[:, :, 1].astype(np.float32)
+        darkness = 255.0 - green
+        blurred = cv2.GaussianBlur(darkness, (7, 7), 0)
+        thresh = np.percentile(blurred, 92)
+        candidates_mask = (blurred > thresh).astype(np.uint8)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(candidates_mask)
+        ranked = []
+        for lbl in range(1, num_labels):
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            if 30 <= area <= 2500:
+                cx, cy = int(centroids[lbl][0]), int(centroids[lbl][1])
+                ranked.append((blurred[cy, cx], cx, cy))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        for _, cx, cy in ranked[:max_candidates]:
+            if any((cx - c["center"][0])**2 + (cy - c["center"][1])**2 < (28**2) for c in cells):
+                continue
+            cell_data = segment_whole_cell_at_point(medsam_predictor, image_rgb, cx, cy)
+            if cell_data is not None:
+                cell_data["id"] = len(cells) + 1
+                cells.append(cell_data)
 
     return cells
 

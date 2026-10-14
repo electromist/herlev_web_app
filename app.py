@@ -1558,7 +1558,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
     )
 
     model_status = (
-        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `HoVer-Net (PanNuke)` | `Cell Division & Whole-Cell (CSGO & Mitosis AI)`  \n"
+        f"Models Available: `MedSAM (ViT-B)` | `EfficientNet-B7 + FPN` | `HoVer-Net (PanNuke)` | `Cell Division & Whole-Cell (Cellpose Cyto3 & Mitosis AI)`  \n"
         f"Device: `{device}`  \n"
     )
     gr.Markdown(model_status)
@@ -1571,7 +1571,7 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
                     "Herlev (EffNet-B7)",
                     # "Oral Histopath AI (ScribblePrompt & Morphometry)",  # [Commented out for now]
                     "HoVer-Net PanNuke (Official Model)",
-                    "Cell Division & Whole-Cell Boundary (CSGO & Mitosis AI)"
+                    "Cell Division & Whole-Cell Boundary (Cellpose Cyto3 & Mitosis AI)"
                 ],
                 value="MedSAM",
                 label="Segmentation Model",
@@ -1735,14 +1735,14 @@ with gr.Blocks(title="Cervical Cell Segmentation & MedSAM Nuclei Identification"
             """
         )
 
-    # 4. Cell Division & Whole-Cell Boundary Container (CSGO & Mitosis AI)
+    # 4. Cell Division & Whole-Cell Boundary Container (Cellpose Cyto3 & Mitosis AI)
     celldiv_state = gr.State(None)
     with gr.Column(visible=False) as celldiv_container:
         gr.Markdown(
             r"""
-            ### 🧬 Cell Division & Whole-Cell Boundary Segmentation (CSGO & Mitosis AI)
-            *Whole-Cell Plasma Membrane & Mitotic Figure Identification (Gu et al., Lab Invest 2025 / OMG-Net criteria)*  
-            - **Whole-Cell Boundary**: Segments the outer cellular boundary (plasma membrane + cytoplasm), **NOT** just the inner nucleus.
+            ### 🧬 Cell Division & Whole-Cell Boundary Segmentation (Cellpose Cyto3 & Mitosis AI)
+            *Whole-Cell Plasma Membrane & Mitotic Figure Identification (Cellpose Cyto3 / CSGO)*  
+            - **Whole-Cell Boundary**: Segments the entire outer cellular boundary (plasma membrane + cytoplasm), **NOT** just the inner nucleus.
             - **Cell Division / Mitosis Analysis**: Assesses chromatin hyper-condensation, mitotic equatorial plates, cytokinesis cleavage furrows, and Nuclear-to-Cytoplasmic (N:C) ratios.
             - **How to use**: Click anywhere with **'+'** on any cell to segment its whole-cell boundary and analyze cell division!
             """
